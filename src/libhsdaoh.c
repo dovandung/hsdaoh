@@ -31,6 +31,7 @@
 #include <stdbool.h>
 #ifndef _WIN32
 #include <unistd.h>
+#include <sched.h>
 #else
 #include <windows.h>
 #define usleep(t) Sleep((t)/1000)
@@ -662,32 +663,144 @@ static void hsdaoh_output(hsdaoh_dev_t *dev, uint16_t sid, int format, uint32_t 
 	}
 }
 
+/*
+ * Thread priority: a late wakeup of the receiving threads makes libuvc
+ * overwrite a finished frame before it was processed, which shows up as a
+ * missed frame. Raise the priority of the threads on the receive path.
+ * Failure is silently ignored (e.g. no permission for real-time scheduling).
+ * Set the environment variable HSDAOH_NORMAL_PRIORITY to disable this.
+ */
+static bool hsdaoh_priority_disabled(void)
+{
+	return getenv("HSDAOH_NORMAL_PRIORITY") != NULL;
+}
+
+static void hsdaoh_raise_thread_priority(void)
+{
+	if (hsdaoh_priority_disabled())
+		return;
+#ifdef _WIN32
+	SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+#else
+	struct sched_param sp;
+	sp.sched_priority = sched_get_priority_min(SCHED_FIFO) + 1;
+	pthread_setschedparam(pthread_self(), SCHED_FIFO, &sp);
+#endif
+}
+
+/* The libusb/libuvc USB event thread is created inside libuvc, so on Windows
+ * raise the whole process to the high priority class to cover it as well. */
+static void hsdaoh_raise_process_priority(void)
+{
+	if (hsdaoh_priority_disabled())
+		return;
+#ifdef _WIN32
+	SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS);
+#endif
+}
+
+/*
+ * Frame buffer pool: hsdaoh_process_frame() needs a width*height*2 byte buffer
+ * for every received frame. Allocating and freeing 4 MB per frame makes the OS
+ * hand out fresh pages each time (page faults, zeroing), so buffers are
+ * recycled instead.
+ */
+static uint8_t *hsdaoh_pool_get(hsdaoh_dev_t *dev)
+{
+	uint8_t *buf = NULL;
+
+	pthread_mutex_lock(&dev->pool_mutex);
+	if (dev->pool_cnt > 0)
+		buf = dev->pool[--dev->pool_cnt];
+	else
+		dev->pool_allocs++;
+	pthread_mutex_unlock(&dev->pool_mutex);
+
+	if (!buf)
+		buf = malloc(dev->pool_bufsize);
+
+	return buf;
+}
+
+static void hsdaoh_pool_put(hsdaoh_dev_t *dev, uint8_t *buf)
+{
+	if (!buf)
+		return;
+
+	pthread_mutex_lock(&dev->pool_mutex);
+	if (dev->pool_cnt < HSDAOH_FRAMEBUF_POOL_MAX) {
+		dev->pool[dev->pool_cnt++] = buf;
+		buf = NULL;
+	}
+	pthread_mutex_unlock(&dev->pool_mutex);
+
+	free(buf);	/* pool full: no-op if the buffer was kept */
+}
+
+static void hsdaoh_pool_init(hsdaoh_dev_t *dev, size_t bufsize)
+{
+	pthread_mutex_init(&dev->pool_mutex, NULL);
+	dev->pool_cnt = 0;
+	dev->pool_allocs = 0;
+	dev->pool_bufsize = bufsize;
+
+	/* pre-allocate and touch a few buffers so the first frames don't fault */
+	for (unsigned int i = 0; i < HSDAOH_FRAMEBUF_PREALLOC; i++) {
+		uint8_t *buf = malloc(bufsize);
+		if (!buf)
+			break;
+		memset(buf, 0, bufsize);
+		dev->pool[dev->pool_cnt++] = buf;
+	}
+}
+
+static void hsdaoh_pool_free(hsdaoh_dev_t *dev)
+{
+	pthread_mutex_lock(&dev->pool_mutex);
+	while (dev->pool_cnt > 0)
+		free(dev->pool[--dev->pool_cnt]);
+	pthread_mutex_unlock(&dev->pool_mutex);
+	pthread_mutex_destroy(&dev->pool_mutex);
+}
+
+static void hsdaoh_release_data(hsdaoh_dev_t *dev, uint8_t *data, bool pooled)
+{
+	if (pooled)
+		hsdaoh_pool_put(dev, data);
+	else
+		free(data);
+}
+
 static void *hsdaoh_output_worker(void *arg)
 {
 	struct llist *curelem, *prev;
 	struct timespec ts;
 	struct timeval tp;
-	fd_set writefds;
-	int r = 0;
 	hsdaoh_dev_t *dev = (hsdaoh_dev_t *)arg;
 
+	hsdaoh_raise_thread_priority();
+
 	while(1) {
-		if (dev->async_status != HSDAOH_RUNNING)
-			pthread_exit(NULL);
-
 		pthread_mutex_lock(&dev->ll_mutex);
-		gettimeofday(&tp, NULL);
-		ts.tv_sec  = tp.tv_sec+1;
-		ts.tv_nsec = tp.tv_usec * 1000;
-		r = pthread_cond_timedwait(&dev->cond, &dev->ll_mutex, &ts);
 
-		if (r == ETIMEDOUT) {
+		/* only sleep while there is nothing to do, so a signal sent while
+		 * we were busy writing output is not lost */
+		while (dev->ll_buffers == NULL && dev->async_status == HSDAOH_RUNNING) {
+			gettimeofday(&tp, NULL);
+			ts.tv_sec  = tp.tv_sec+1;
+			ts.tv_nsec = tp.tv_usec * 1000;
+			pthread_cond_timedwait(&dev->cond, &dev->ll_mutex, &ts);
+		}
+
+		if (dev->async_status != HSDAOH_RUNNING) {
 			pthread_mutex_unlock(&dev->ll_mutex);
-			continue;
+			pthread_exit(NULL);
 		}
 
 		curelem = dev->ll_buffers;
 		dev->ll_buffers = NULL;
+		dev->ll_tail = NULL;
+		dev->ll_count = 0;
 		pthread_mutex_unlock(&dev->ll_mutex);
 
 		while (curelem != NULL) {
@@ -695,50 +808,57 @@ static void *hsdaoh_output_worker(void *arg)
 
 			prev = curelem;
 			curelem = curelem->next;
-			free(prev->data);
+			hsdaoh_release_data(dev, prev->data, prev->pooled);
 			free(prev);
 		}
 	}
 }
 
-static void hsdaoh_enqueue_data(hsdaoh_dev_t *dev, uint16_t sid, int format, uint32_t srate, uint8_t *data, size_t len)
+static void hsdaoh_enqueue_data(hsdaoh_dev_t *dev, uint16_t sid, int format, uint32_t srate,
+				uint8_t *data, size_t len, bool pooled)
 {
 	if (dev->async_status != HSDAOH_RUNNING) {
-		free(data);
+		hsdaoh_release_data(dev, data, pooled);
 		return;
 	}
 
 	struct llist *rpt = (struct llist*)malloc(sizeof(struct llist));
+	if (!rpt) {
+		hsdaoh_release_data(dev, data, pooled);
+		return;
+	}
+
 	rpt->data = data;
 	rpt->len = len;
 	rpt->sid = sid;
 	rpt->format = format;
 	rpt->srate = srate;
+	rpt->pooled = pooled;
 	rpt->next = NULL;
 
 	pthread_mutex_lock(&dev->ll_mutex);
 
 	if (dev->ll_buffers == NULL) {
 		dev->ll_buffers = rpt;
+		dev->ll_tail = rpt;
+		dev->ll_count = 1;
 	} else {
-		struct llist *cur = dev->ll_buffers;
-		unsigned int num_queued = 0;
-
-		while (cur->next != NULL) {
-			cur = cur->next;
-			num_queued++;
-		}
+		/* same value the previous list walk produced: queue length - 1 */
+		unsigned int num_queued = dev->ll_count - 1;
 
 		if (dev->llbuf_num && dev->llbuf_num == num_queued-2) {
 			struct llist *curelem;
 			fprintf(stderr, "Buffer dropped due to overrun!\n");
-			free(dev->ll_buffers->data);
+			hsdaoh_release_data(dev, dev->ll_buffers->data, dev->ll_buffers->pooled);
 			curelem = dev->ll_buffers->next;
 			free(dev->ll_buffers);
 			dev->ll_buffers = curelem;
+			dev->ll_count--;
 		}
 
-		cur->next = rpt;
+		dev->ll_tail->next = rpt;
+		dev->ll_tail = rpt;
+		dev->ll_count++;
 
 		if (num_queued > dev->highest_numq) {
 			fprintf(stderr, "Maximum buffer queue length: %d\n", num_queued);
@@ -807,7 +927,7 @@ static void hsdaoh_process_frame(hsdaoh_dev_t *dev, uint8_t *data, int size)
 	int frame_errors = 0;
 	unsigned int stream0_payload_bytes = 0;
 	uint16_t stream0_format = 0;
-	uint8_t *stream0_data = malloc(dev->width * dev->height * sizeof(uint16_t));
+	uint8_t *stream0_data = hsdaoh_pool_get(dev);
 
 	if (!stream0_data) {
 		fprintf(stderr, "Out of memory, frame skipped!\n");
@@ -838,7 +958,7 @@ static void hsdaoh_process_frame(hsdaoh_dev_t *dev, uint8_t *data, int size)
 				fprintf(stderr, "Invalid payload length: %d\n", payload_len);
 
 			/* discard frame */
-			free(stream0_data);
+			hsdaoh_pool_put(dev, stream0_data);
 			return;
 		}
 
@@ -866,15 +986,15 @@ static void hsdaoh_process_frame(hsdaoh_dev_t *dev, uint8_t *data, int size)
 				uint8_t *out_data = malloc(out_len);
 				uint32_t srate = stream_id < DEFAULT_MAX_STREAMS ? meta.stream_info[stream_id].srate : 0;
 				memcpy(out_data, line_dat, out_len);
-				hsdaoh_enqueue_data(dev, stream_id, format, srate, out_data, out_len);
+				hsdaoh_enqueue_data(dev, stream_id, format, srate, out_data, out_len, false);
 			}
 		}
 	}
 
 	if (dev->stream_synced && stream0_payload_bytes)
-		hsdaoh_enqueue_data(dev, 0, stream0_format, meta.stream_info[0].srate, stream0_data, stream0_payload_bytes);
+		hsdaoh_enqueue_data(dev, 0, stream0_format, meta.stream_info[0].srate, stream0_data, stream0_payload_bytes, true);
 	else
-		free(stream0_data);
+		hsdaoh_pool_put(dev, stream0_data);
 
 	if (frame_errors && dev->stream_synced) {
 		fprintf(stderr,"%d frame errors, %d frames since last error\n", frame_errors, dev->frames_since_error);
@@ -893,6 +1013,12 @@ static void _hsdaoh_uvc_callback(uvc_frame_t *frame, void *ptr)
 	hsdaoh_dev_t *dev = (hsdaoh_dev_t *)ptr;
 	if (!dev)
 		return;
+
+	/* this runs in libuvc's callback thread: raise its priority once */
+	if (!dev->uvc_thread_prio_set) {
+		hsdaoh_raise_thread_priority();
+		dev->uvc_thread_prio_set = true;
+	}
 
 	dev->uvc_frame_count++;
 
@@ -926,6 +1052,72 @@ static void _hsdaoh_uvc_callback(uvc_frame_t *frame, void *ptr)
 		hsdaoh_ms213xs_transparent_mode(dev, true);
 }
 
+/* Set up output queue, frame buffer pool and output worker thread.
+ * dev->async_status must already be HSDAOH_RUNNING. */
+static int hsdaoh_output_start(hsdaoh_dev_t *dev, unsigned int buf_num, size_t frame_bufsize)
+{
+	/* initialize with a threshold */
+	dev->highest_numq = DEFAULT_BUFFERS/2;
+	dev->llbuf_num = (buf_num == 0) ? DEFAULT_BUFFERS : buf_num;
+
+	dev->ll_buffers = NULL;
+	dev->ll_tail = NULL;
+	dev->ll_count = 0;
+	dev->global_numq = 0;
+
+	pthread_mutex_init(&dev->ll_mutex, NULL);
+	pthread_cond_init(&dev->cond, NULL);
+
+	hsdaoh_pool_init(dev, frame_bufsize);
+	hsdaoh_raise_process_priority();
+	dev->uvc_thread_prio_set = false;
+
+	pthread_attr_t attr;
+	pthread_attr_init(&attr);
+	pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_JOINABLE);
+	int r = pthread_create(&dev->hsdaoh_output_worker_thread, &attr, hsdaoh_output_worker, (void *)dev);
+	pthread_attr_destroy(&attr);
+	if (r != 0) {
+		fprintf(stderr, "Failed to create worker thread!\n");
+		hsdaoh_pool_free(dev);
+		return -1;
+	}
+
+	return 0;
+}
+
+/* Stop the output worker and release everything still queued.
+ * No more frames may be processed when this is called. */
+static void hsdaoh_output_stop(hsdaoh_dev_t *dev)
+{
+	void *status;
+	struct llist *curelem, *prev;
+
+	pthread_mutex_lock(&dev->ll_mutex);
+	pthread_cond_signal(&dev->cond);
+	pthread_mutex_unlock(&dev->ll_mutex);
+
+	pthread_join(dev->hsdaoh_output_worker_thread, &status);
+
+	curelem = dev->ll_buffers;
+	dev->ll_buffers = NULL;
+	dev->ll_tail = NULL;
+	dev->ll_count = 0;
+
+	while (curelem != NULL) {
+		prev = curelem;
+		curelem = curelem->next;
+		hsdaoh_release_data(dev, prev->data, prev->pooled);
+		free(prev);
+	}
+
+	dev->global_numq = 0;
+
+	hsdaoh_pool_free(dev);
+	pthread_cond_destroy(&dev->cond);
+	pthread_mutex_destroy(&dev->ll_mutex);
+}
+
 int hsdaoh_start_stream(hsdaoh_dev_t *dev, hsdaoh_read_cb_t cb, void *ctx, unsigned int buf_num)
 {
 	if (!dev)
@@ -945,33 +1137,20 @@ int hsdaoh_start_stream(hsdaoh_dev_t *dev, hsdaoh_read_cb_t cb, void *ctx, unsig
 
 //	dev->output_float = true;
 
-	/* initialize with a threshold */
-	dev->highest_numq = DEFAULT_BUFFERS/2;
-	dev->llbuf_num = (buf_num == 0) ? DEFAULT_BUFFERS : buf_num;
+	dev->width = 1920;
+	dev->height = 1080;
+	dev->fps = 60;
 
-	pthread_mutex_init(&dev->ll_mutex, NULL);
-	pthread_cond_init(&dev->cond, NULL);
-
-	pthread_attr_t attr;
-	pthread_attr_init(&attr);
-	pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_JOINABLE);
-	int r = pthread_create(&dev->hsdaoh_output_worker_thread, &attr, hsdaoh_output_worker, (void *)dev);
-	pthread_attr_destroy(&attr);
+	int r = hsdaoh_output_start(dev, buf_num, dev->width * dev->height * sizeof(uint16_t));
 	if (r < 0) {
-		fprintf(stderr, "Failed to create worker thread!\n");
+		dev->async_status = HSDAOH_INACTIVE;
 		return r;
 	}
 
 	uvc_error_t res;
 	uvc_stream_ctrl_t ctrl;
 
-	const uvc_format_desc_t *format_desc = uvc_get_format_descs(dev->uvc_devh);
-	const uvc_frame_desc_t *frame_desc = format_desc->frame_descs;
 	enum uvc_frame_format frame_format = UVC_FRAME_FORMAT_YUYV;
-
-	dev->width = 1920;
-	dev->height = 1080;
-	dev->fps = 60;
 
 	res = uvc_get_stream_ctrl_format_size(dev->uvc_devh, &ctrl, frame_format, dev->width, dev->height, dev->fps);
 	if (res == UVC_ERROR_INVALID_MODE) {
@@ -1001,26 +1180,11 @@ int hsdaoh_stop_stream(hsdaoh_dev_t *dev)
 	if (HSDAOH_RUNNING == dev->async_status) {
 		dev->async_status = HSDAOH_CANCELING;
 		dev->async_cancel = 1;
-		pthread_cond_signal(&dev->cond);
 
 		/* End the stream. Blocks until last callback is serviced */
 		uvc_stop_streaming(dev->uvc_devh);
 
-		void *status;
-		struct llist *curelem, *prev;
-		pthread_join(dev->hsdaoh_output_worker_thread, &status);
-
-		curelem = dev->ll_buffers;
-		dev->ll_buffers = NULL;
-
-		while (curelem != 0) {
-			prev = curelem;
-			curelem = curelem->next;
-			free(prev->data);
-			free(prev);
-		}
-
-		dev->global_numq = 0;
+		hsdaoh_output_stop(dev);
 
 		return 0;
 	}

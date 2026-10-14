@@ -13,8 +13,14 @@ struct llist {
 	uint16_t sid;
 	uint16_t format;
 	uint32_t srate;
+	bool pooled;		/* data belongs to the frame buffer pool */
 	struct llist *next;
 };
+
+/* Number of full-frame payload buffers kept for reuse. Buffers beyond this
+ * (e.g. when the output queue backs up) fall back to plain malloc/free. */
+#define HSDAOH_FRAMEBUF_POOL_MAX	16
+#define HSDAOH_FRAMEBUF_PREALLOC	4
 
 struct hsdaoh_dev {
 	libusb_context *ctx;
@@ -64,7 +70,18 @@ struct hsdaoh_dev {
 	unsigned int highest_numq;
 	unsigned int global_numq;
 	struct llist *ll_buffers;
+	struct llist *ll_tail;		/* last queued element, for O(1) append */
+	unsigned int ll_count;		/* number of queued elements */
 	unsigned int llbuf_num;
+
+	/* recycled full-frame payload buffers */
+	pthread_mutex_t pool_mutex;
+	uint8_t *pool[HSDAOH_FRAMEBUF_POOL_MAX];
+	unsigned int pool_cnt;
+	size_t pool_bufsize;
+	unsigned int pool_allocs;	/* buffers allocated (not reused), for diagnostics */
+
+	bool uvc_thread_prio_set;
 };
 
 enum
