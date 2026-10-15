@@ -1,0 +1,137 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  hsdaoh_la for Visual Studio (MSVC).
+
+  Builds only the hsdaoh_la program. libhsdaoh itself is built with MinGW;
+  this project links against its import library libhsdaoh.lib.
+
+  Needs:
+    - the hsdaoh Windows package (include\, lib\libhsdaoh.lib, *.dll) extracted
+      to msvc\hsdaoh-win64\ (or set HsdaohDir, see below)
+    - vcpkg (manifest mode, vcpkg.json in this folder) for pthreads and getopt
+  See README.md.
+-->
+<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|x64">
+      <Configuration>Debug</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+
+  <PropertyGroup Label="Globals">
+    <VCProjectVersion>17.0</VCProjectVersion>
+    <ProjectGuid>{44740AF4-720E-4E30-A328-0CB1690CB5FD}</ProjectGuid>
+    <RootNamespace>hsdaoh_la</RootNamespace>
+    <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
+  </PropertyGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+
+  <PropertyGroup Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType>
+    <!-- use whatever toolset the installed Visual Studio has (v143 = VS 2022) -->
+    <PlatformToolset Condition="'$(DefaultPlatformToolset)' != ''">$(DefaultPlatformToolset)</PlatformToolset>
+    <PlatformToolset Condition="'$(PlatformToolset)' == ''">v143</PlatformToolset>
+    <!-- NOT Unicode: vcpkg's getopt would switch to the wchar_t version -->
+    <CharacterSet>MultiByte</CharacterSet>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)'=='Debug'" Label="Configuration">
+    <UseDebugLibraries>true</UseDebugLibraries>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)'=='Release'" Label="Configuration">
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <WholeProgramOptimization>true</WholeProgramOptimization>
+  </PropertyGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+
+  <ImportGroup Label="PropertySheets">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+
+  <!-- vcpkg: install pthreads + getopt from vcpkg.json, link them, copy their DLLs -->
+  <PropertyGroup Label="Vcpkg">
+    <VcpkgEnableManifest>true</VcpkgEnableManifest>
+    <VcpkgTriplet>x64-windows</VcpkgTriplet>
+  </PropertyGroup>
+
+  <PropertyGroup Label="UserMacros">
+    <!-- folder with include\, lib\libhsdaoh.lib and libhsdaoh.dll / libusb-1.0.dll.
+         Override from the command line: msbuild /p:HsdaohDir=C:\hsdaoh\ -->
+    <HsdaohDir Condition="'$(HsdaohDir)' == ''">$(MSBuildThisFileDirectory)hsdaoh-win64\</HsdaohDir>
+  </PropertyGroup>
+
+  <PropertyGroup>
+    <OutDir>$(MSBuildThisFileDirectory)$(Platform)\$(Configuration)\</OutDir>
+    <IntDir>$(MSBuildThisFileDirectory)obj\$(Platform)\$(Configuration)\</IntDir>
+    <TargetName>hsdaoh_la</TargetName>
+    <LocalDebuggerCommandArguments>-n 1M -o test.sr</LocalDebuggerCommandArguments>
+    <LocalDebuggerWorkingDirectory>$(OutDir)</LocalDebuggerWorkingDirectory>
+    <DebuggerFlavor>WindowsLocalDebugger</DebuggerFlavor>
+  </PropertyGroup>
+
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <WarningLevel>Level3</WarningLevel>
+      <SDLCheck>false</SDLCheck>
+      <ConformanceMode>true</ConformanceMode>
+      <CompileAs>CompileAsC</CompileAs>
+      <LanguageStandard_C>stdc11</LanguageStandard_C>
+      <AdditionalIncludeDirectories>$(HsdaohDir)include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <PreprocessorDefinitions>_CRT_SECURE_NO_WARNINGS;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+    <Link>
+      <SubSystem>Console</SubSystem>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+      <AdditionalDependencies>$(HsdaohDir)lib\libhsdaoh.lib;%(AdditionalDependencies)</AdditionalDependencies>
+    </Link>
+    <PreBuildEvent>
+      <Command>if exist "$(HsdaohDir)lib\libhsdaoh.lib" exit /b 0
+echo error: $(HsdaohDir)lib\libhsdaoh.lib not found. Extract the hsdaoh Windows package to $(HsdaohDir) - see msvc\README.md
+exit /b 1</Command>
+      <Message>Checking for libhsdaoh</Message>
+    </PreBuildEvent>
+    <PostBuildEvent>
+      <!-- libhsdaoh.dll and libusb-1.0.dll next to the exe (vcpkg copies its own DLLs) -->
+      <Command>xcopy /y /d /q "$(HsdaohDir)*.dll" "$(OutDir)" &gt;nul</Command>
+      <Message>Copying libhsdaoh DLLs</Message>
+    </PostBuildEvent>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)'=='Debug'">
+    <ClCompile>
+      <Optimization>Disabled</Optimization>
+      <PreprocessorDefinitions>_DEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)'=='Release'">
+    <ClCompile>
+      <Optimization>MaxSpeed</Optimization>
+      <FunctionLevelLinking>true</FunctionLevelLinking>
+      <IntrinsicFunctions>true</IntrinsicFunctions>
+      <PreprocessorDefinitions>NDEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+    <Link>
+      <EnableCOMDATFolding>true</EnableCOMDATFolding>
+      <OptimizeReferences>true</OptimizeReferences>
+    </Link>
+  </ItemDefinitionGroup>
+
+  <ItemGroup>
+    <ClCompile Include="..\src\hsdaoh_la.c" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="$(HsdaohDir)include\hsdaoh.h" />
+    <ClInclude Include="$(HsdaohDir)include\hsdaoh_export.h" />
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="vcpkg.json" />
+    <None Include="README.md" />
+  </ItemGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+</Project>

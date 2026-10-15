@@ -1,0 +1,10 @@
+{
+  "name": "hsdaoh-la",
+  "version-string": "0.1",
+  "description": "hsdaoh_la logic analyzer, MSVC build",
+  "dependencies": [
+    "pthreads",
+    "getopt"
+  ],
+  "builtin-baseline": "20ceb8adbf0504d4b0d5e4058a32f9d4fc896391"
+}

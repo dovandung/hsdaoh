@@ -1,0 +1,6 @@
+/hsdaoh-win64/
+/vcpkg_installed/
+/x64/
+/obj/
+/.vs/
+*.user
