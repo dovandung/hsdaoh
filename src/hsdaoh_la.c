@@ -33,15 +33,14 @@
 #include <stdbool.h>
 #include <ctype.h>
 #include <time.h>
+#include <pthread.h>
 
 #ifndef _WIN32
 #include <unistd.h>
 #include <getopt.h>
-#define fseek64 fseeko
 #else
 #include <windows.h>
 #include <getopt.h>
-#define fseek64 _fseeki64
 #ifndef usleep
 #define usleep(t) Sleep((t)/1000)
 #endif
@@ -164,28 +163,14 @@ static int trigger_parse(trigger_t *t, const char *spec)
 	return 0;
 }
 
-/* ------------------------------------------------------------------ writers */
+/* ------------------------------------------------------------------ file output */
+
+/*
+ * Captures are first collected in RAM and written to disk afterwards by a
+ * separate thread, so the disk speed never limits the capture.
+ */
 
 enum { OUT_BIN, OUT_SR, OUT_VCD };
-
-typedef struct {
-	FILE *f;
-	int type;
-	char path[1200];
-	uint64_t nsamples;
-	uint64_t samplerate;
-	uint64_t trigger_pos;
-	/* .sr */
-	uint32_t crc;
-	int64_t data_hdr_off;
-	uint32_t ver_crc, meta_crc, meta_len;
-	int64_t meta_hdr_off;
-	uint16_t dos_time, dos_date;
-	/* .vcd: samples go to a raw temp file in real time, text is made on close */
-	char tmp_path[1210];
-	double ps_per_sample;
-	char *vbuf;
-} writer_t;
 
 static int out_type_from_name(const char *path)
 {
@@ -200,45 +185,58 @@ static int out_type_from_name(const char *path)
 static void put16(FILE *f, uint16_t v) { fputc(v & 0xff, f); fputc(v >> 8, f); }
 static void put32(FILE *f, uint32_t v) { put16(f, v & 0xffff); put16(f, v >> 16); }
 
-static void zip_local_header(writer_t *w, const char *name, uint32_t crc, uint32_t size)
+static int write_all(FILE *f, const uint8_t *d, uint64_t n)
 {
-	put32(w->f, 0x04034b50);
-	put16(w->f, 10);		/* version needed: stored */
-	put16(w->f, 0);			/* flags */
-	put16(w->f, 0);			/* method: stored */
-	put16(w->f, w->dos_time);
-	put16(w->f, w->dos_date);
-	put32(w->f, crc);
-	put32(w->f, size);
-	put32(w->f, size);
-	put16(w->f, (uint16_t)strlen(name));
-	put16(w->f, 0);
-	fwrite(name, 1, strlen(name), w->f);
+	const uint64_t chunk = 64ULL << 20;
+	while (n) {
+		size_t m = (size_t)(n < chunk ? n : chunk);
+		if (fwrite(d, 1, m, f) != m)
+			return -1;
+		d += m;
+		n -= m;
+	}
+	return 0;
 }
 
-static void zip_central_entry(writer_t *w, const char *name, uint32_t crc, uint32_t size, uint32_t off)
+static void zip_local_header(FILE *f, const char *name, uint32_t crc, uint32_t size,
+			     uint16_t dtime, uint16_t ddate)
 {
-	put32(w->f, 0x02014b50);
-	put16(w->f, 20);		/* made by */
-	put16(w->f, 10);		/* needed */
-	put16(w->f, 0);
-	put16(w->f, 0);
-	put16(w->f, w->dos_time);
-	put16(w->f, w->dos_date);
-	put32(w->f, crc);
-	put32(w->f, size);
-	put32(w->f, size);
-	put16(w->f, (uint16_t)strlen(name));
-	put16(w->f, 0);			/* extra */
-	put16(w->f, 0);			/* comment */
-	put16(w->f, 0);			/* disk */
-	put16(w->f, 0);			/* internal attr */
-	put32(w->f, 0);			/* external attr */
-	put32(w->f, off);
-	fwrite(name, 1, strlen(name), w->f);
+	put32(f, 0x04034b50);
+	put16(f, 10);			/* version needed: stored */
+	put16(f, 0);			/* flags */
+	put16(f, 0);			/* method: stored */
+	put16(f, dtime);
+	put16(f, ddate);
+	put32(f, crc);
+	put32(f, size);
+	put32(f, size);
+	put16(f, (uint16_t)strlen(name));
+	put16(f, 0);
+	fwrite(name, 1, strlen(name), f);
 }
 
-static const char sr_version[] = "2";
+static void zip_central_entry(FILE *f, const char *name, uint32_t crc, uint32_t size, uint32_t off,
+			      uint16_t dtime, uint16_t ddate)
+{
+	put32(f, 0x02014b50);
+	put16(f, 20);			/* made by */
+	put16(f, 10);			/* needed */
+	put16(f, 0);
+	put16(f, 0);
+	put16(f, dtime);
+	put16(f, ddate);
+	put32(f, crc);
+	put32(f, size);
+	put32(f, size);
+	put16(f, (uint16_t)strlen(name));
+	put16(f, 0);			/* extra */
+	put16(f, 0);			/* comment */
+	put16(f, 0);			/* disk */
+	put16(f, 0);			/* internal attr */
+	put32(f, 0);			/* external attr */
+	put32(f, off);
+	fwrite(name, 1, strlen(name), f);
+}
 
 static int sr_metadata(char *buf, size_t sz, uint64_t samplerate)
 {
@@ -257,45 +255,48 @@ static int sr_metadata(char *buf, size_t sz, uint64_t samplerate)
 	return n;
 }
 
-static int writer_open(writer_t *w, const char *path, uint64_t samplerate, uint64_t trigger_pos)
+/* sigrok session file: an uncompressed zip with version, metadata and data */
+static int save_sr(FILE *f, const uint8_t *d, uint64_t n, uint64_t samplerate)
 {
-	memset(w, 0, sizeof(*w));
-	snprintf(w->path, sizeof(w->path), "%s", path);
-	w->type = out_type_from_name(path);
-	w->samplerate = samplerate;
-	w->trigger_pos = trigger_pos;
-	snprintf(w->tmp_path, sizeof(w->tmp_path), "%s.tmp", path);
-	const char *open_path = (w->type == OUT_VCD) ? w->tmp_path : path;
-	w->f = fopen(open_path, "wb");
-	if (!w->f) {
-		fprintf(stderr, "Cannot create %s: %s\n", open_path, strerror(errno));
-		return -1;
+	static const char ver[] = "2";
+	static const char *names[3] = { "version", "metadata", "logic-1-1" };
+	char meta[1024];
+	uint32_t len[3], crc[3], off[3];
+
+	time_t now = time(NULL);
+	struct tm *tm = localtime(&now);
+	uint16_t dtime = (uint16_t)((tm->tm_hour << 11) | (tm->tm_min << 5) | (tm->tm_sec / 2));
+	uint16_t ddate = (uint16_t)(((tm->tm_year - 80) << 9) | ((tm->tm_mon + 1) << 5) | tm->tm_mday);
+
+	len[0] = 1;
+	len[1] = (uint32_t)sr_metadata(meta, sizeof(meta), samplerate);
+	len[2] = (uint32_t)n;
+	crc[0] = crc32_update(0, (const uint8_t *)ver, 1);
+	crc[1] = crc32_update(0, (const uint8_t *)meta, len[1]);
+	crc[2] = crc32_update(0, d, n);
+	const uint8_t *content[3] = { (const uint8_t *)ver, (const uint8_t *)meta, d };
+
+	uint32_t pos = 0;
+	for (int i = 0; i < 3; i++) {
+		off[i] = pos;
+		zip_local_header(f, names[i], crc[i], len[i], dtime, ddate);
+		if (write_all(f, content[i], len[i]))
+			return -1;
+		pos += 30 + (uint32_t)strlen(names[i]) + len[i];
 	}
-	w->vbuf = malloc(4 << 20);
-	if (w->vbuf)
-		setvbuf(w->f, w->vbuf, _IOFBF, 4 << 20);
-
-	if (w->type == OUT_SR) {
-		time_t now = time(NULL);
-		struct tm *tm = localtime(&now);
-		w->dos_time = (uint16_t)((tm->tm_hour << 11) | (tm->tm_min << 5) | (tm->tm_sec / 2));
-		w->dos_date = (uint16_t)(((tm->tm_year - 80) << 9) | ((tm->tm_mon + 1) << 5) | tm->tm_mday);
-
-		char meta[1024];
-		w->meta_len = (uint32_t)sr_metadata(meta, sizeof(meta), samplerate);
-		w->ver_crc = crc32_update(0, (const uint8_t *)sr_version, 1);
-		w->meta_crc = crc32_update(0, (const uint8_t *)meta, w->meta_len);
-
-		zip_local_header(w, "version", w->ver_crc, 1);
-		fwrite(sr_version, 1, 1, w->f);
-		w->meta_hdr_off = ftell(w->f);
-		zip_local_header(w, "metadata", w->meta_crc, w->meta_len);
-		fwrite(meta, 1, w->meta_len, w->f);
-		w->data_hdr_off = ftell(w->f);
-		zip_local_header(w, "logic-1-1", 0, 0);	/* patched on close */
-	} else if (w->type == OUT_VCD) {
-		w->ps_per_sample = samplerate ? 1e12 / (double)samplerate : 1.0;
+	uint32_t cd_off = pos;
+	for (int i = 0; i < 3; i++) {
+		zip_central_entry(f, names[i], crc[i], len[i], off[i], dtime, ddate);
+		pos += 46 + (uint32_t)strlen(names[i]);
 	}
+	put32(f, 0x06054b50);
+	put16(f, 0);
+	put16(f, 0);
+	put16(f, 3);
+	put16(f, 3);
+	put32(f, pos - cd_off);
+	put32(f, cd_off);
+	put16(f, 0);
 	return 0;
 }
 
@@ -312,60 +313,49 @@ static char *put_u64(char *p, uint64_t v)
 	return p;
 }
 
-/* Convert the raw temp file to VCD text (runs after the capture, not in real time) */
-static int vcd_convert(writer_t *w)
+static int save_vcd(FILE *f, const uint8_t *d, uint64_t n, uint64_t samplerate, uint64_t trigger_pos)
 {
-	enum { IN_CHUNK = 256 * 1024, MAX_PER_SAMPLE = 22 + 3 * LA_CHANNELS };
-	FILE *in = fopen(w->tmp_path, "rb");
-	FILE *out = fopen(w->path, "wb");
-	uint8_t *ib = malloc(IN_CHUNK);
-	char *ob = malloc((size_t)IN_CHUNK * MAX_PER_SAMPLE + 64);
-	int r = 0;
-
-	if (!in || !out || !ib || !ob) {
-		fprintf(stderr, "Cannot create %s: %s\n", w->path, strerror(errno));
-		r = -1;
-		goto done;
-	}
-	setvbuf(out, NULL, _IOFBF, 4 << 20);
+	enum { CHUNK = 256 * 1024, MAX_PER_SAMPLE = 22 + 3 * LA_CHANNELS };
+	double ps = samplerate ? 1e12 / (double)samplerate : 1.0;
+	char *ob = malloc((size_t)CHUNK * MAX_PER_SAMPLE + 256);
+	if (!ob)
+		return -1;
 
 	time_t now = time(NULL);
-	fprintf(out, "$date %s$end\n", ctime(&now));
-	fprintf(out, "$version hsdaoh_la $end\n");
-	fprintf(out, "$comment samplerate %llu Hz, trigger at sample %llu $end\n",
-		(unsigned long long)w->samplerate, (unsigned long long)w->trigger_pos);
-	fprintf(out, "$timescale 1 ps $end\n$scope module la $end\n");
+	fprintf(f, "$date %s$end\n", ctime(&now));
+	fprintf(f, "$version hsdaoh_la $end\n");
+	fprintf(f, "$comment samplerate %llu Hz, trigger at sample %llu $end\n",
+		(unsigned long long)samplerate, (unsigned long long)trigger_pos);
+	fprintf(f, "$timescale 1 ps $end\n$scope module la $end\n");
 	for (int i = 0; i < LA_CHANNELS; i++)
-		fprintf(out, "$var wire 1 %c D%d $end\n", '!' + i, i);
-	fprintf(out, "$upscope $end\n$enddefinitions $end\n");
+		fprintf(f, "$var wire 1 %c D%d $end\n", '!' + i, i);
+	fprintf(f, "$upscope $end\n$enddefinitions $end\n");
 
-	uint64_t idx = 0;
-	uint8_t last = 0;
-	size_t n;
-	while ((n = fread(ib, 1, IN_CHUNK, in)) > 0) {
+	uint8_t last = n ? d[0] : 0;
+	for (uint64_t start = 0; start < n; start += CHUNK) {
+		uint64_t end = start + CHUNK < n ? start + CHUNK : n;
 		char *p = ob;
-		size_t i = 0;
-		if (idx == 0) {
+		uint64_t i = start;
+		if (start == 0) {
 			p += sprintf(p, "#0\n$dumpvars\n");
 			for (int b = 0; b < LA_CHANNELS; b++) {
-				*p++ = (char)('0' + ((ib[0] >> b) & 1));
+				*p++ = (char)('0' + ((d[0] >> b) & 1));
 				*p++ = (char)('!' + b);
 				*p++ = '\n';
 			}
 			p += sprintf(p, "$end\n");
-			last = ib[0];
 			i = 1;
 		}
-		for (; i < n; i++) {
-			uint8_t c = ib[i];
+		for (; i < end; i++) {
+			uint8_t c = d[i];
 			if (c == last)
 				continue;
 			*p++ = '#';
-			p = put_u64(p, (uint64_t)((double)(idx + i) * w->ps_per_sample + 0.5));
+			p = put_u64(p, (uint64_t)((double)i * ps + 0.5));
 			*p++ = '\n';
-			uint8_t d = c ^ last;
+			uint8_t x = c ^ last;
 			for (int b = 0; b < LA_CHANNELS; b++) {
-				if (d & (1u << b)) {
+				if (x & (1u << b)) {
 					*p++ = (char)('0' + ((c >> b) & 1));
 					*p++ = (char)('!' + b);
 					*p++ = '\n';
@@ -373,125 +363,99 @@ static int vcd_convert(writer_t *w)
 			}
 			last = c;
 		}
-		if (fwrite(ob, 1, (size_t)(p - ob), out) != (size_t)(p - ob)) {
-			r = -1;
-			break;
+		if (fwrite(ob, 1, (size_t)(p - ob), f) != (size_t)(p - ob)) {
+			free(ob);
+			return -1;
 		}
-		idx += n;
 	}
-	if (ferror(in))
-		r = -1;
-	fprintf(out, "#%llu\n", (unsigned long long)((double)idx * w->ps_per_sample + 0.5));
-	if (fflush(out) || ferror(out))
-		r = -1;
-done:
-	if (in)
-		fclose(in);
-	if (out && fclose(out))
-		r = -1;
-	free(ib);
+	fprintf(f, "#%llu\n", (unsigned long long)((double)n * ps + 0.5));
 	free(ob);
-	remove(w->tmp_path);
-	return r;
-}
-
-static int writer_write(writer_t *w, const uint8_t *s, size_t n)
-{
-	if (!n)
-		return 0;
-
-	if (w->type == OUT_SR)
-		w->crc = crc32_update(w->crc, s, n);
-	if (fwrite(s, 1, n, w->f) != n) {
-		fprintf(stderr, "Write error on %s: %s\n", w->path, strerror(errno));
-		return -1;
-	}
-	w->nsamples += n;
 	return 0;
 }
 
-static int writer_close(writer_t *w)
+static double now_s(void)
 {
-	int r = 0;
-	if (!w->f)
-		return -1;
-
-	if (w->type == OUT_SR) {
-		uint32_t size = (uint32_t)w->nsamples;
-		int64_t cd_off = (int64_t)w->data_hdr_off + 30 + 9 + (int64_t)w->nsamples;
-
-		/* central directory */
-		zip_central_entry(w, "version", w->ver_crc, 1, 0);
-		zip_central_entry(w, "metadata", w->meta_crc, w->meta_len, (uint32_t)w->meta_hdr_off);
-		zip_central_entry(w, "logic-1-1", w->crc, size, (uint32_t)w->data_hdr_off);
-		int64_t cd_end = cd_off + 3 * 46 + 7 + 8 + 9;
-		put32(w->f, 0x06054b50);
-		put16(w->f, 0);
-		put16(w->f, 0);
-		put16(w->f, 3);
-		put16(w->f, 3);
-		put32(w->f, (uint32_t)(cd_end - cd_off));
-		put32(w->f, (uint32_t)cd_off);
-		put16(w->f, 0);
-
-		/* patch CRC and sizes of the data entry */
-		if (fseek64(w->f, w->data_hdr_off + 14, SEEK_SET) == 0) {
-			put32(w->f, w->crc);
-			put32(w->f, size);
-			put32(w->f, size);
-		} else {
-			r = -1;
-		}
-	}
-
-	if (fflush(w->f) || ferror(w->f))
-		r = -1;
-	if (fclose(w->f))
-		r = -1;
-	w->f = NULL;
-	free(w->vbuf);
-	w->vbuf = NULL;
-
-	if (w->type == OUT_VCD) {
-		if (r == 0)
-			r = vcd_convert(w);
-		else
-			remove(w->tmp_path);
-	}
-	if (r)
-		fprintf(stderr, "Error finishing %s\n", w->path);
-	return r;
+	struct timespec ts;
+	timespec_get(&ts, TIME_UTC);
+	return ts.tv_sec + ts.tv_nsec * 1e-9;
 }
 
-static void writer_abort(writer_t *w)
+static int save_capture(const char *path, const uint8_t *d, uint64_t n, uint64_t samplerate,
+			uint64_t trigger_pos)
 {
-	if (w->f) {
-		fclose(w->f);
-		w->f = NULL;
-		remove(w->type == OUT_VCD ? w->tmp_path : w->path);
+	int r;
+	double t0 = now_s();
+	FILE *f = fopen(path, "wb");
+	if (!f) {
+		fprintf(stderr, "Cannot create %s: %s\n", path, strerror(errno));
+		return -1;
 	}
-	free(w->vbuf);
-	w->vbuf = NULL;
+	setvbuf(f, NULL, _IOFBF, 4 << 20);
+
+	switch (out_type_from_name(path)) {
+	case OUT_SR:  r = save_sr(f, d, n, samplerate); break;
+	case OUT_VCD: r = save_vcd(f, d, n, samplerate, trigger_pos); break;
+	default:      r = write_all(f, d, n); break;
+	}
+	if (fflush(f) || ferror(f))
+		r = -1;
+	if (fclose(f))
+		r = -1;
+	if (r) {
+		fprintf(stderr, "Error writing %s: %s\n", path, strerror(errno));
+		remove(path);
+		return -1;
+	}
+	double dt = now_s() - t0;
+	fprintf(stderr, "Written %s: %llu samples, trigger at sample %llu (%.1f s, %.0f MB/s)\n",
+		path, (unsigned long long)n, (unsigned long long)trigger_pos, dt,
+		dt > 0 ? n / dt / 1e6 : 0.0);
+	return 0;
 }
 
 /* ------------------------------------------------------------------ capture */
 
 enum { LA_ARMED, LA_CAPTURING, LA_DONE };
+enum { CB_FREE, CB_FILLING, CB_SAVING };
+
+#define MAX_CAPBUFS	2
+
+typedef struct {
+	uint8_t *data;
+	uint64_t len;
+	uint64_t trigger_pos;
+	uint32_t srate;
+	bool partial;
+	int state;
+	unsigned seq;
+	char path[1200];
+} capbuf_t;
 
 typedef struct {
 	trigger_t trig;
 	uint64_t pre, post;
 	int captures_wanted;		/* 0 = unlimited */
-	int captures_done;
+	int captures_done;		/* captures completed in RAM */
 	char out_base[1024];
 	uint64_t srate_override;
 	bool ignore_gaps;
 	bool quiet;
 
 	volatile int state;
-	writer_t w;
 	uint64_t remaining;
-	uint64_t trig_abs;		/* absolute sample index of trigger */
+
+	/* RAM capture buffers, written to disk by the saver thread */
+	capbuf_t bufs[MAX_CAPBUFS];
+	int nbufs;
+	capbuf_t *cur;			/* reserved for the next/current capture */
+	pthread_t saver;
+	bool saver_running;
+	pthread_mutex_t mtx;
+	pthread_cond_t cond;
+	bool saver_quit;
+	unsigned save_seq;
+	volatile int saves_done, saves_failed;
+	bool told_busy;
 
 	/* pre-trigger history ring */
 	uint8_t *hist;
@@ -503,7 +467,6 @@ typedef struct {
 	/* gap detection */
 	bool cnt_known, cnt_unsupported;
 	uint64_t next_cnt;
-	uint64_t abs_sample;		/* absolute index of next incoming sample */
 
 	uint8_t *lin;
 	size_t lin_cap;
@@ -530,22 +493,140 @@ static void la_capture_name(la_t *la, char *out, size_t sz)
 	snprintf(out, sz, "%.*s_%03d%s", stem, la->out_base, la->captures_done + 1, dot ? dot : "");
 }
 
+static void *saver_thread(void *arg)
+{
+	la_t *la = (la_t *)arg;
+
+	pthread_mutex_lock(&la->mtx);
+	while (1) {
+		capbuf_t *b = NULL;
+		for (int i = 0; i < la->nbufs; i++)
+			if (la->bufs[i].state == CB_SAVING && (!b || la->bufs[i].seq < b->seq))
+				b = &la->bufs[i];
+		if (b) {
+			pthread_mutex_unlock(&la->mtx);
+#ifdef HSDAOH_LA_TEST_SAVE_DELAY_US
+			usleep(HSDAOH_LA_TEST_SAVE_DELAY_US);	/* tests only: simulate a slow disk */
+#endif
+			int r = save_capture(b->path, b->data, b->len, b->srate, b->trigger_pos);
+			pthread_mutex_lock(&la->mtx);
+			b->state = CB_FREE;
+			b->len = 0;
+			if (r)
+				la->saves_failed++;
+			else
+				la->saves_done++;
+			continue;
+		}
+		if (la->saver_quit)
+			break;
+		pthread_cond_wait(&la->cond, &la->mtx);
+	}
+	pthread_mutex_unlock(&la->mtx);
+	return NULL;
+}
+
+/* Allocate (and touch, so the OS really provides it) the RAM buffers */
 static int la_init(la_t *la)
 {
+	uint64_t cap = la->pre + la->post;
+
+	la->nbufs = (la->captures_wanted == 1) ? 1 : MAX_CAPBUFS;
+	if (cap > SIZE_MAX) {
+		fprintf(stderr, "Capture too large for this system\n");
+		return -1;
+	}
+	for (int i = 0; i < la->nbufs; i++) {
+		la->bufs[i].data = malloc((size_t)cap);
+		if (!la->bufs[i].data) {
+			fprintf(stderr, "Not enough memory: need %d x %.0f MB for -p + -n. "
+				"Reduce -n/-p%s.\n", la->nbufs, cap / 1e6,
+				la->nbufs > 1 ? " or capture once (-c 1 needs half)" : "");
+			return -1;
+		}
+		memset(la->bufs[i].data, 0, (size_t)cap);
+		la->bufs[i].state = CB_FREE;
+	}
 	if (la->pre) {
-		la->hist = malloc(la->pre);
+		la->hist = malloc((size_t)la->pre);
 		if (!la->hist) {
-			fprintf(stderr, "Cannot allocate %llu bytes for pre-trigger buffer\n",
-				(unsigned long long)la->pre);
+			fprintf(stderr, "Not enough memory for the pre-trigger buffer\n");
 			return -1;
 		}
 	}
+
+	pthread_mutex_init(&la->mtx, NULL);
+	pthread_cond_init(&la->cond, NULL);
+	if (pthread_create(&la->saver, NULL, saver_thread, la) != 0) {
+		fprintf(stderr, "Cannot start saver thread\n");
+		return -1;
+	}
+	la->saver_running = true;
 	la->state = LA_ARMED;
 	return 0;
 }
 
-static void la_free(la_t *la)
+static capbuf_t *la_reserve_buffer(la_t *la)
 {
+	if (la->cur)
+		return la->cur;
+	pthread_mutex_lock(&la->mtx);
+	for (int i = 0; i < la->nbufs; i++) {
+		if (la->bufs[i].state == CB_FREE) {
+			la->bufs[i].state = CB_FILLING;
+			la->bufs[i].len = 0;
+			la->cur = &la->bufs[i];
+			break;
+		}
+	}
+	pthread_mutex_unlock(&la->mtx);
+	return la->cur;
+}
+
+static void la_queue_save(la_t *la, bool partial)
+{
+	capbuf_t *b = la->cur;
+	la->cur = NULL;
+	b->partial = partial;
+	la->captures_done++;
+	if (!la->quiet || partial)
+		fprintf(stderr, "\nCaptured %llu samples%s, writing %s in the background\n",
+			(unsigned long long)b->len, partial ? " (stopped early)" : "", b->path);
+	pthread_mutex_lock(&la->mtx);
+	b->state = CB_SAVING;
+	b->seq = la->save_seq++;
+	pthread_cond_broadcast(&la->cond);
+	pthread_mutex_unlock(&la->mtx);
+}
+
+/* Call after the stream has stopped: save a partial capture, wait for all
+ * files to be written, free everything. */
+static void la_finish(la_t *la, bool save_partial)
+{
+	if (la->state == LA_CAPTURING && la->cur && save_partial && la->cur->len)
+		la_queue_save(la, true);
+	if (la->cur) {
+		pthread_mutex_lock(&la->mtx);
+		la->cur->state = CB_FREE;
+		pthread_mutex_unlock(&la->mtx);
+		la->cur = NULL;
+	}
+	if (la->saver_running) {
+		pthread_mutex_lock(&la->mtx);
+		la->saver_quit = true;
+		pthread_cond_broadcast(&la->cond);
+		pthread_mutex_unlock(&la->mtx);
+		pthread_join(la->saver, NULL);
+		la->saver_running = false;
+		pthread_cond_destroy(&la->cond);
+		pthread_mutex_destroy(&la->mtx);
+	}
+	if (la->saves_failed)
+		la->error = true;
+	for (int i = 0; i < la->nbufs; i++) {
+		free(la->bufs[i].data);
+		la->bufs[i].data = NULL;
+	}
 	free(la->hist);
 	free(la->lin);
 	la->hist = NULL;
@@ -578,19 +659,18 @@ static void hist_push(la_t *la, const uint8_t *s, uint64_t n)
 	la->hist_len = (la->hist_len + n > cap) ? cap : la->hist_len + n;
 }
 
-/* write the newest n samples of the history, oldest first */
-static int hist_write(la_t *la, uint64_t n)
+/* copy the newest n samples of the history, oldest first */
+static void hist_copy(la_t *la, uint8_t *dst, uint64_t n)
 {
 	if (!n)
-		return 0;
+		return;
 	uint64_t cap = la->pre;
 	uint64_t start = (la->hist_head + cap - n) % cap;
 	uint64_t first = cap - start;
 	if (first > n)
 		first = n;
-	if (writer_write(&la->w, la->hist + start, first))
-		return -1;
-	return writer_write(&la->w, la->hist, n - first);
+	memcpy(dst, la->hist + start, first);
+	memcpy(dst + first, la->hist, n - first);
 }
 
 static void la_on_gap(la_t *la, uint64_t lost)
@@ -601,29 +681,17 @@ static void la_on_gap(la_t *la, uint64_t lost)
 	la->have_prev = false;
 
 	if (la->state == LA_CAPTURING && !la->ignore_gaps) {
-		fprintf(stderr, "\nData was lost during the capture (%llu samples): discarding %s and re-arming.\n",
-			(unsigned long long)lost, la->w.path);
-		writer_abort(&la->w);
+		fprintf(stderr, "\nData was lost during the capture (%llu samples): discarding it and re-arming.\n",
+			(unsigned long long)lost);
+		la->cur->len = 0;		/* keep the buffer reserved for the next try */
 		la->state = LA_ARMED;
 	} else if (la->state == LA_CAPTURING) {
-		fprintf(stderr, "\nWarning: %llu samples lost inside capture %s (continuing, -G given)\n",
-			(unsigned long long)lost, la->w.path);
+		fprintf(stderr, "\nWarning: %llu samples lost inside the capture (continuing, -G given)\n",
+			(unsigned long long)lost);
 	} else if (!la->quiet) {
 		fprintf(stderr, "\nData lost while armed (%llu samples), pre-trigger history restarted\n",
 			(unsigned long long)lost);
 	}
-}
-
-static void la_finish_capture(la_t *la, bool partial)
-{
-	uint64_t n = la->w.nsamples;
-	int r = writer_close(&la->w);
-	la->captures_done++;
-	if (r)
-		la->error = true;
-	fprintf(stderr, "\n%s %s: %llu samples, trigger at sample %llu%s\n",
-		r ? "FAILED" : "Saved", la->w.path, (unsigned long long)n,
-		(unsigned long long)la->w.trigger_pos, partial ? " (stopped early)" : "");
 }
 
 /* Scan for the trigger in s[from..n), return index or n */
@@ -647,57 +715,56 @@ static void la_process_samples(la_t *la, const uint8_t *s, size_t n)
 
 	while (i < n && la->state != LA_DONE) {
 		if (la->state == LA_ARMED) {
+			capbuf_t *b = la_reserve_buffer(la);
+			if (!b) {
+				/* all buffers still being written: keep history, don't trigger */
+				if (!la->told_busy) {
+					fprintf(stderr, "\nPrevious capture still being written to disk, not armed yet...\n");
+					la->told_busy = true;
+				}
+				hist_push(la, s + i, n - i);
+				break;
+			}
+			la->told_busy = false;
+
 			size_t k = la_find_trigger(la, s, i, n);
 			if (k == n) {
 				hist_push(la, s + i, n - i);
 				break;
 			}
 
-			/* trigger at s[k] */
+			/* trigger at s[k]: pre-trigger samples from history + this buffer */
 			uint64_t from_chunk = k - i;
-			uint64_t want = la->pre;
-			uint64_t from_lin = from_chunk < want ? from_chunk : want;
-			uint64_t from_hist = want - from_lin;
+			uint64_t from_lin = from_chunk < la->pre ? from_chunk : la->pre;
+			uint64_t from_hist = la->pre - from_lin;
 			if (from_hist > la->hist_len)
 				from_hist = la->hist_len;
 
-			char name[1100];
-			la_capture_name(la, name, sizeof(name));
-			uint32_t srate = la->srate_override ? (uint32_t)la->srate_override : la->srate;
-			if (writer_open(&la->w, name, srate, from_hist + from_lin)) {
-				la->error = true;
-				la->state = LA_DONE;
-				return;
-			}
-			la->trig_abs = la->abs_sample + k;
+			la_capture_name(la, b->path, sizeof(b->path));
+			b->srate = la->srate_override ? (uint32_t)la->srate_override : la->srate;
+			hist_copy(la, b->data, from_hist);
+			memcpy(b->data + from_hist, s + k - from_lin, from_lin);
+			b->len = from_hist + from_lin;
+			b->trigger_pos = b->len;
 			if (!la->quiet)
-				fprintf(stderr, "\nTriggered (%s), capturing to %s ...\n", la->trig.desc, name);
+				fprintf(stderr, "\nTriggered (%s), capturing to memory...\n", la->trig.desc);
 
-			if (hist_write(la, from_hist) || writer_write(&la->w, s + k - from_lin, from_lin)) {
-				writer_abort(&la->w);
-				la->error = true;
-				la->state = LA_DONE;
-				return;
-			}
 			la->remaining = la->post;
 			la->state = LA_CAPTURING;
 			i = k;
 		}
 
 		if (la->state == LA_CAPTURING) {
+			capbuf_t *b = la->cur;
 			uint64_t m = n - i;
 			if (m > la->remaining)
 				m = la->remaining;
-			if (writer_write(&la->w, s + i, m)) {
-				writer_abort(&la->w);
-				la->error = true;
-				la->state = LA_DONE;
-				return;
-			}
+			memcpy(b->data + b->len, s + i, m);
+			b->len += m;
 			la->remaining -= m;
 			i += m;
 			if (la->remaining == 0) {
-				la_finish_capture(la, false);
+				la_queue_save(la, false);
 				hist_reset(la);
 				if (la->captures_wanted && la->captures_done >= la->captures_wanted)
 					la->state = LA_DONE;
@@ -735,7 +802,6 @@ static void la_process_buffer(la_t *la, const uint8_t *buf, size_t len, uint64_t
 			fprintf(stderr, "Note: firmware does not report its sample counter; lost data cannot be detected.\n");
 		} else if (la->cnt_known && data_cnt != la->next_cnt) {
 			uint64_t lost = (data_cnt > la->next_cnt) ? (data_cnt - la->next_cnt) * 2 : 0;
-			la->abs_sample += lost;
 			la_on_gap(la, lost);
 		}
 		la->next_cnt = data_cnt + words;
@@ -760,7 +826,6 @@ static void la_process_buffer(la_t *la, const uint8_t *buf, size_t len, uint64_t
 	}
 
 	la_process_samples(la, la->lin, n);
-	la->abs_sample += n;
 	la->samples_rx += n;
 }
 
@@ -806,7 +871,9 @@ static void usage(void)
 		"\t-c count     number of captures, files get _001, _002... (default 1, 0 = endless)\n"
 		"\t-r rate      override the sample rate in Hz written to the file\n"
 		"\t-G           keep a capture even if data was lost during it\n"
-		"\t-d index     device index (default 0)\n", DEFAULT_OUTFILE);
+		"\t-d index     device index (default 0)\n\n"
+		"Captures are collected in RAM (1 byte per sample, -p + -n bytes; twice that\n"
+		"with -c other than 1) and written to disk after the capture.\n", DEFAULT_OUTFILE);
 	exit(1);
 }
 
@@ -861,12 +928,16 @@ int main(int argc, char **argv)
 	}
 
 	crc32_init();
-	if (trigger_parse(&la.trig, trig) || la_init(&la))
+	if (trigger_parse(&la.trig, trig))
+		return 1;
+	fprintf(stderr, "Allocating capture memory...\n");
+	if (la_init(&la))
 		return 1;
 
 	r = hsdaoh_open(&dev, (uint32_t)dev_index);
 	if (r < 0) {
 		fprintf(stderr, "Failed to open hsdaoh device #%d.\n", dev_index);
+		la_finish(&la, false);
 		return 1;
 	}
 
@@ -881,9 +952,10 @@ int main(int argc, char **argv)
 	SetConsoleCtrlHandler((PHANDLER_ROUTINE)sighandler, TRUE);
 #endif
 
-	fprintf(stderr, "Trigger: %s, saving %llu samples before + %llu from trigger, %d capture(s) to %s\n",
+	fprintf(stderr, "Trigger: %s, %llu samples before + %llu from trigger, %d capture(s) to %s\n"
+		"Capture memory: %d x %.0f MB\n",
 		la.trig.desc, (unsigned long long)la.pre, (unsigned long long)la.post,
-		la.captures_wanted, la.out_base);
+		la.captures_wanted, la.out_base, la.nbufs, (la.pre + la.post) / 1e6);
 
 	r = hsdaoh_start_stream(dev, la_callback, NULL, 0);
 
@@ -902,19 +974,20 @@ int main(int argc, char **argv)
 
 	hsdaoh_stop_stream(dev);	/* no more callbacks after this */
 
-	if (la.state == LA_CAPTURING)
-		la_finish_capture(&la, true);
 	if (do_exit)
 		fprintf(stderr, "\nStopped by user.\n");
 	else if (r)
 		fprintf(stderr, "\nLibrary error %d.\n", r);
 
-	fprintf(stderr, "%d capture(s) saved, %llu samples received, %llu gaps (%llu samples lost).\n",
-		la.captures_done, (unsigned long long)la.samples_rx,
+	fprintf(stderr, "Waiting for files to be written...\n");
+	la_finish(&la, true);
+
+	fprintf(stderr, "%d file(s) written%s, %llu samples received, %llu gaps (%llu samples lost).\n",
+		la.saves_done, la.saves_failed ? " (some FAILED)" : "",
+		(unsigned long long)la.samples_rx,
 		(unsigned long long)la.gaps, (unsigned long long)la.lost_samples);
 
 	hsdaoh_close(dev);
-	la_free(&la);
 	return (r || la.error) ? 1 : 0;
 }
 
