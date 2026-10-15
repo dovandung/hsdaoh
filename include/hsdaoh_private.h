@@ -14,6 +14,7 @@ struct llist {
 	uint16_t format;
 	uint32_t srate;
 	bool pooled;		/* data belongs to the frame buffer pool */
+	uint64_t data_cnt;	/* device word counter at start of data */
 	struct llist *next;
 };
 

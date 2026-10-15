@@ -47,6 +47,12 @@ typedef struct hsdaoh_data_info {
 	bool is_signed;
 	bool is_float;
 	bool device_error;		/* device error happened, terminate application */
+	/* Number of 16-bit link words of this stream the device had sent before
+	 * the first word of this buffer (as reported by the device; 0 if the
+	 * device firmware does not report it). If a buffer's data_cnt is not the
+	 * previous buffer's data_cnt plus the previous buffer's word count, data
+	 * was lost in between. Counts raw link words, also for unpacked formats. */
+	uint64_t data_cnt;
 } hsdaoh_data_info_t;
 
 typedef struct hsdaoh_dev hsdaoh_dev_t;

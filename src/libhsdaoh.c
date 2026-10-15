@@ -621,7 +621,8 @@ int hsdaoh_set_output_format(hsdaoh_dev_t *dev, hsdaoh_output_format_t format)
 	return 0;
 }
 
-static void hsdaoh_output(hsdaoh_dev_t *dev, uint16_t sid, int format, uint32_t srate, uint8_t *data, size_t len)
+static void hsdaoh_output(hsdaoh_dev_t *dev, uint16_t sid, int format, uint32_t srate, uint8_t *data, size_t len,
+			  uint64_t data_cnt)
 {
 	hsdaoh_data_info_t data_info;
 	data_info.ctx = dev->cb_ctx;
@@ -634,6 +635,7 @@ static void hsdaoh_output(hsdaoh_dev_t *dev, uint16_t sid, int format, uint32_t 
 	data_info.is_signed = false;
 	data_info.is_float = false;
 	data_info.device_error = false;
+	data_info.data_cnt = data_cnt;
 
 	switch (format) {
 		case PIO_8BIT_IQ:
@@ -804,7 +806,8 @@ static void *hsdaoh_output_worker(void *arg)
 		pthread_mutex_unlock(&dev->ll_mutex);
 
 		while (curelem != NULL) {
-			hsdaoh_output(dev, curelem->sid, curelem->format, curelem->srate, curelem->data, curelem->len);
+			hsdaoh_output(dev, curelem->sid, curelem->format, curelem->srate, curelem->data, curelem->len,
+				      curelem->data_cnt);
 
 			prev = curelem;
 			curelem = curelem->next;
@@ -815,7 +818,7 @@ static void *hsdaoh_output_worker(void *arg)
 }
 
 static void hsdaoh_enqueue_data(hsdaoh_dev_t *dev, uint16_t sid, int format, uint32_t srate,
-				uint8_t *data, size_t len, bool pooled)
+				uint8_t *data, size_t len, bool pooled, uint64_t data_cnt)
 {
 	if (dev->async_status != HSDAOH_RUNNING) {
 		hsdaoh_release_data(dev, data, pooled);
@@ -834,6 +837,7 @@ static void hsdaoh_enqueue_data(hsdaoh_dev_t *dev, uint16_t sid, int format, uin
 	rpt->format = format;
 	rpt->srate = srate;
 	rpt->pooled = pooled;
+	rpt->data_cnt = data_cnt;
 	rpt->next = NULL;
 
 	pthread_mutex_lock(&dev->ll_mutex);
@@ -927,6 +931,8 @@ static void hsdaoh_process_frame(hsdaoh_dev_t *dev, uint8_t *data, int size)
 	int frame_errors = 0;
 	unsigned int stream0_payload_bytes = 0;
 	uint16_t stream0_format = 0;
+	/* words of each stream seen so far in this frame, for data_cnt of per-line buffers */
+	uint64_t stream_words[DEFAULT_MAX_STREAMS] = { 0 };
 	uint8_t *stream0_data = hsdaoh_pool_get(dev);
 
 	if (!stream0_data) {
@@ -984,15 +990,24 @@ static void hsdaoh_process_frame(hsdaoh_dev_t *dev, uint8_t *data, int size)
 				stream0_format = format;
 			} else {
 				uint8_t *out_data = malloc(out_len);
-				uint32_t srate = stream_id < DEFAULT_MAX_STREAMS ? meta.stream_info[stream_id].srate : 0;
+				uint32_t srate = 0;
+				uint64_t cnt = 0;
+				if (stream_id < DEFAULT_MAX_STREAMS) {
+					srate = meta.stream_info[stream_id].srate;
+					cnt = meta.stream_info[stream_id].data_cnt + stream_words[stream_id];
+					stream_words[stream_id] += payload_len;
+				}
+				if (!out_data)
+					continue;
 				memcpy(out_data, line_dat, out_len);
-				hsdaoh_enqueue_data(dev, stream_id, format, srate, out_data, out_len, false);
+				hsdaoh_enqueue_data(dev, stream_id, format, srate, out_data, out_len, false, cnt);
 			}
 		}
 	}
 
 	if (dev->stream_synced && stream0_payload_bytes)
-		hsdaoh_enqueue_data(dev, 0, stream0_format, meta.stream_info[0].srate, stream0_data, stream0_payload_bytes, true);
+		hsdaoh_enqueue_data(dev, 0, stream0_format, meta.stream_info[0].srate, stream0_data, stream0_payload_bytes,
+				    true, meta.stream_info[0].data_cnt);
 	else
 		hsdaoh_pool_put(dev, stream0_data);
 

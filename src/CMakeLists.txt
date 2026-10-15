@@ -80,7 +80,8 @@ endif()
 add_executable(hsdaoh_file hsdaoh_file.c)
 add_executable(hsdaoh_tcp hsdaoh_tcp.c)
 add_executable(hsdaoh_test hsdaoh_test.c)
-set(INSTALL_TARGETS hsdaoh hsdaoh_static hsdaoh_file hsdaoh_tcp hsdaoh_test)
+add_executable(hsdaoh_la hsdaoh_la.c)
+set(INSTALL_TARGETS hsdaoh hsdaoh_static hsdaoh_file hsdaoh_tcp hsdaoh_test hsdaoh_la)
 
 target_link_libraries(hsdaoh_file hsdaoh
     ${LIBFLAC_LIBRARIES}
@@ -90,6 +91,9 @@ target_link_libraries(hsdaoh_tcp hsdaoh
     ${CMAKE_THREAD_LIBS_INIT}
 )
 target_link_libraries(hsdaoh_test hsdaoh
+    ${CMAKE_THREAD_LIBS_INIT}
+)
+target_link_libraries(hsdaoh_la hsdaoh
     ${CMAKE_THREAD_LIBS_INIT}
 )
 if(UNIX)
@@ -105,6 +109,7 @@ target_link_libraries(hsdaoh_tcp ws2_32)
 set_property(TARGET hsdaoh_file APPEND PROPERTY COMPILE_DEFINITIONS "hsdaoh_STATIC" )
 set_property(TARGET hsdaoh_tcp APPEND PROPERTY COMPILE_DEFINITIONS "hsdaoh_STATIC" )
 set_property(TARGET hsdaoh_test APPEND PROPERTY COMPILE_DEFINITIONS "hsdaoh_STATIC" )
+set_property(TARGET hsdaoh_la APPEND PROPERTY COMPILE_DEFINITIONS "hsdaoh_STATIC" )
 endif()
 ########################################################################
 # Install built library files & utilities
@@ -115,6 +120,6 @@ install(TARGETS hsdaoh EXPORT HSDAOH-export
 install(TARGETS hsdaoh_static EXPORT HSDAOH-export
   ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR} # .so/.dylib file
   )
-install(TARGETS hsdaoh_file hsdaoh_tcp hsdaoh_test
+install(TARGETS hsdaoh_file hsdaoh_tcp hsdaoh_test hsdaoh_la
   DESTINATION ${CMAKE_INSTALL_BINDIR}
   )
