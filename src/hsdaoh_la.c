@@ -38,6 +38,9 @@
 #ifndef _WIN32
 #include <unistd.h>
 #include <getopt.h>
+#include <fcntl.h>
+#include <termios.h>
+#include <sys/ioctl.h>
 #else
 #include <windows.h>
 #include <getopt.h>
@@ -844,6 +847,193 @@ static void la_callback(hsdaoh_data_info_t *di)
 	la_process_buffer(&la, di->buf, di->len, di->data_cnt, di->srate);
 }
 
+/* ------------------------------------------------------- Pico serial port */
+/*
+ * The la8 firmware takes commands on the Pico's USB serial port:
+ *   "div <n>"  sample rate = system clock / n
+ *   "?"        print the current setting
+ * It answers with a status line ending in "commands: div <n>   ?", or with
+ * "divider must be ..." if n is below the HDMI link limit.
+ */
+
+#ifdef _WIN32
+typedef HANDLE la_ser_t;
+#define LA_SER_INVALID INVALID_HANDLE_VALUE
+#else
+typedef int la_ser_t;
+#define LA_SER_INVALID (-1)
+#endif
+
+static la_ser_t ser_open(const char *name)
+{
+#ifdef _WIN32
+	char path[64];
+	/* accept "COM5", "com5" or just "5"; \\.\ is needed for COM10 and up */
+	if (isdigit((unsigned char)name[0]))
+		snprintf(path, sizeof(path), "\\\\.\\COM%s", name);
+	else if (!strncmp(name, "\\\\.\\", 4))
+		snprintf(path, sizeof(path), "%s", name);
+	else
+		snprintf(path, sizeof(path), "\\\\.\\%s", name);
+
+	HANDLE h = CreateFileA(path, GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
+	if (h == INVALID_HANDLE_VALUE)
+		return h;
+
+	DCB dcb;
+	memset(&dcb, 0, sizeof(dcb));
+	dcb.DCBlength = sizeof(dcb);
+	if (GetCommState(h, &dcb)) {
+		dcb.BaudRate = 115200;		/* ignored by USB CDC, but must be valid */
+		dcb.ByteSize = 8;
+		dcb.Parity = NOPARITY;
+		dcb.StopBits = ONESTOPBIT;
+		dcb.fBinary = TRUE;
+		dcb.fParity = FALSE;
+		dcb.fOutxCtsFlow = FALSE;
+		dcb.fOutxDsrFlow = FALSE;
+		dcb.fDtrControl = DTR_CONTROL_ENABLE;	/* the Pico only sends while DTR is set */
+		dcb.fRtsControl = RTS_CONTROL_ENABLE;
+		dcb.fOutX = FALSE;
+		dcb.fInX = FALSE;
+		SetCommState(h, &dcb);
+	}
+	COMMTIMEOUTS to;
+	memset(&to, 0, sizeof(to));
+	to.ReadIntervalTimeout = MAXDWORD;	/* return what is there, wait up to 50 ms */
+	to.ReadTotalTimeoutMultiplier = MAXDWORD;
+	to.ReadTotalTimeoutConstant = 50;
+	to.WriteTotalTimeoutConstant = 500;
+	SetCommTimeouts(h, &to);
+	EscapeCommFunction(h, SETDTR);
+	return h;
+#else
+	int fd = open(name, O_RDWR | O_NOCTTY);
+	if (fd < 0)
+		return -1;
+	struct termios tio;
+	if (tcgetattr(fd, &tio) == 0) {
+		cfmakeraw(&tio);
+		cfsetispeed(&tio, B115200);
+		cfsetospeed(&tio, B115200);
+		tio.c_cflag |= CLOCAL | CREAD;
+		tio.c_cc[VMIN] = 0;
+		tio.c_cc[VTIME] = 1;		/* read() returns after 100 ms without data */
+		tcsetattr(fd, TCSANOW, &tio);
+	}
+	int bits = TIOCM_DTR;
+	ioctl(fd, TIOCMBIS, &bits);		/* the Pico only sends while DTR is set */
+	return fd;
+#endif
+}
+
+static void ser_close(la_ser_t s)
+{
+#ifdef _WIN32
+	CloseHandle(s);
+#else
+	close(s);
+#endif
+}
+
+static int ser_write(la_ser_t s, const char *str)
+{
+	size_t len = strlen(str);
+#ifdef _WIN32
+	DWORD done = 0;
+	if (!WriteFile(s, str, (DWORD)len, &done, NULL) || done != len)
+		return -1;
+#else
+	if (write(s, str, len) != (ssize_t)len)
+		return -1;
+#endif
+	return 0;
+}
+
+/* read whatever arrives within ~50-100 ms; returns bytes read, <0 on error */
+static int ser_read(la_ser_t s, char *buf, size_t size)
+{
+#ifdef _WIN32
+	DWORD got = 0;
+	if (!ReadFile(s, buf, (DWORD)size, &got, NULL))
+		return -1;
+	return (int)got;
+#else
+	ssize_t got = read(s, buf, size);
+	return got < 0 ? -1 : (int)got;
+#endif
+}
+
+/*
+ * Send one command to the la8 firmware and print its answer.
+ * Returns 0 if the firmware accepted it, -1 if it refused it or did not
+ * answer, -2 if the serial port could not be used.
+ */
+static int pico_command(const char *port, const char *cmd)
+{
+	la_ser_t s = ser_open(port);
+	if (s == LA_SER_INVALID) {
+		fprintf(stderr, "Cannot open serial port %s (%s). Is it the Pico's port, and is no\n"
+			"terminal program (PuTTY etc.) using it?\n", port,
+#ifdef _WIN32
+			"Windows error"
+#else
+			strerror(errno)
+#endif
+			);
+		return -2;
+	}
+
+	/* drop anything the firmware printed earlier */
+	char reply[2048];
+	double t0 = now_s();
+	while (now_s() - t0 < 0.2)
+		if (ser_read(s, reply, sizeof(reply)) <= 0)
+			break;
+
+	char line[64];
+	snprintf(line, sizeof(line), "%s\r", cmd);
+	if (ser_write(s, line)) {
+		fprintf(stderr, "Writing to serial port %s failed.\n", port);
+		ser_close(s);
+		return -2;
+	}
+
+	/* the status answer ends with the "commands:" line; errors are one line */
+	size_t len = 0;
+	bool done = false, ok = false;
+	t0 = now_s();
+	while (!done && now_s() - t0 < 2.0) {
+		int n = ser_read(s, reply + len, sizeof(reply) - 1 - len);
+		if (n < 0)
+			break;
+		len += (size_t)n;
+		reply[len] = 0;
+		if (strstr(reply, "commands:")) {
+			ok = !strstr(reply, "divider must be") && !strstr(reply, "unknown command");
+			done = true;
+		} else if (strstr(reply, "divider must be") && strchr(strstr(reply, "divider must be"), '\n')) {
+			done = true;
+		}
+		if (len >= sizeof(reply) - 1)
+			break;
+	}
+	ser_close(s);
+
+	if (!len) {
+		fprintf(stderr, "No answer from the Pico on %s (is la8 running on it?).\n", port);
+		return -1;
+	}
+	/* print the answer without the help line */
+	for (char *l = strtok(reply, "\r\n"); l; l = strtok(NULL, "\r\n"))
+		if (strncmp(l, "commands:", 9))
+			fprintf(stderr, "Pico: %s\n", l);
+
+	if (!done)
+		fprintf(stderr, "Incomplete answer from the Pico.\n");
+	return (done && ok) ? 0 : -1;
+}
+
 static uint64_t parse_count(const char *s)
 {
 	char *end;
@@ -871,7 +1061,11 @@ static void usage(void)
 		"\t-c count     number of captures, files get _001, _002... (default 1, 0 = endless)\n"
 		"\t-r rate      override the sample rate in Hz written to the file\n"
 		"\t-G           keep a capture even if data was lost during it\n"
-		"\t-d index     device index (default 0)\n\n"
+		"\t-d index     device index (default 0)\n"
+		"\t-s port      the Pico's USB serial port (Windows: COM5, Linux: /dev/ttyACM0)\n"
+		"\t-D div       with -s: set the sample rate divider before capturing,\n"
+		"\t             rate = Pico system clock / div (la8 140 MS/s preset: 280 MHz / div)\n"
+		"\t             -s without -D only shows the current setting\n\n"
 		"Captures are collected in RAM (1 byte per sample, -p + -n bytes; twice that\n"
 		"with -c other than 1) and written to disk after the capture.\n", DEFAULT_OUTFILE);
 	exit(1);
@@ -899,13 +1093,15 @@ int main(int argc, char **argv)
 	int opt, r;
 	int dev_index = 0;
 	const char *trig = NULL;
+	const char *ser_port = NULL;
+	long set_div = 0;
 
 	memset(&la, 0, sizeof(la));
 	la.post = DEFAULT_POST;
 	la.captures_wanted = 1;
 	snprintf(la.out_base, sizeof(la.out_base), "%s", DEFAULT_OUTFILE);
 
-	while ((opt = getopt(argc, argv, "t:n:p:o:c:r:Gd:qh")) != -1) {
+	while ((opt = getopt(argc, argv, "t:n:p:o:c:r:Gd:s:D:qh")) != -1) {
 		switch (opt) {
 		case 't': trig = optarg; break;
 		case 'n': la.post = parse_count(optarg); break;
@@ -915,12 +1111,39 @@ int main(int argc, char **argv)
 		case 'r': la.srate_override = parse_count(optarg); break;
 		case 'G': la.ignore_gaps = true; break;
 		case 'd': dev_index = atoi(optarg); break;
+		case 's': ser_port = optarg; break;
+		case 'D': set_div = strtol(optarg, NULL, 10); break;
 		case 'q': la.quiet = true; break;
 		default: usage();
 		}
 	}
 	if (la.post == 0)
 		la.post = 1;
+
+	if (set_div && !ser_port) {
+		fprintf(stderr, "-D needs the Pico's serial port: -s COM5 (Windows) or -s /dev/ttyACM0\n");
+		return 1;
+	}
+	if (set_div < 0 || set_div > 65535) {
+		fprintf(stderr, "-D must be 1..65535\n");
+		return 1;
+	}
+	if (ser_port) {
+		char cmd[32];
+		if (set_div)
+			snprintf(cmd, sizeof(cmd), "div %ld", set_div);
+		else
+			snprintf(cmd, sizeof(cmd), "?");
+		int pr = pico_command(ser_port, cmd);
+		if (pr) {
+			if (set_div && pr == -1)
+				fprintf(stderr, "The Pico did not accept the divider, not capturing.\n");
+			return 1;
+		}
+		/* the firmware reports the new rate in the HDMI metadata; give it a
+		 * moment so the first frames we look at already carry it */
+		usleep(200000);
+	}
 	if (out_type_from_name(la.out_base) == OUT_SR && la.pre + la.post > SR_MAX_DATA) {
 		fprintf(stderr, "Capture too large for .sr (max %llu samples), use .bin\n",
 			(unsigned long long)SR_MAX_DATA);
