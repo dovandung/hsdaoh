@@ -80,6 +80,12 @@ endif()
 ########################################################################
 # Find build dependencies
 ########################################################################
+# Library-only / static-only builds, e.g. for linking libhsdaoh into
+# libsigrok's static MinGW (MXE) build:
+#   -DHSDAOH_BUILD_SHARED=OFF -DHSDAOH_BUILD_TOOLS=OFF
+option(HSDAOH_BUILD_SHARED "Build the shared library (libhsdaoh.so / libhsdaoh.dll)" ON)
+option(HSDAOH_BUILD_TOOLS "Build the command line tools (hsdaoh_file needs libFLAC)" ON)
+
 find_package(Threads)
 find_package(PkgConfig)
 
@@ -103,7 +109,7 @@ else()
     set(LIBUVC_INCLUDE_DIRS "" CACHE STRING "manual libuvc includepath")
 endif()
 
-if(PKG_CONFIG_FOUND)
+if(PKG_CONFIG_FOUND AND HSDAOH_BUILD_TOOLS)
     pkg_check_modules(LIBFLAC flac IMPORTED_TARGET)
     if(LIBFLAC_LINK_LIBRARIES)
         set(LIBFLAC_LIBRARIES "${LIBFLAC_LINK_LIBRARIES}")
@@ -119,8 +125,8 @@ endif()
 if(PKG_CONFIG_FOUND AND NOT LIBUVC_FOUND)
     message(FATAL_ERROR "LibUVC required to compile hsdaoh")
 endif()
-if(PKG_CONFIG_FOUND AND NOT LIBFLAC_FOUND)
-    message(FATAL_ERROR "LibFLAC required to compile hsdaoh")
+if(HSDAOH_BUILD_TOOLS AND PKG_CONFIG_FOUND AND NOT LIBFLAC_FOUND)
+    message(FATAL_ERROR "LibFLAC required to compile the hsdaoh tools (or use -DHSDAOH_BUILD_TOOLS=OFF)")
 endif()
 if(NOT THREADS_FOUND)
     message(FATAL_ERROR "pthreads(-win32) required to compile hsdaoh")
@@ -141,7 +147,12 @@ add_custom_target(uninstall
 ########################################################################
 # Install udev rules
 ########################################################################
-option(INSTALL_UDEV_RULES "Install udev rules" ON)
+if(UNIX AND NOT APPLE AND NOT CMAKE_CROSSCOMPILING)
+    set(_udev_default ON)
+else()
+    set(_udev_default OFF)
+endif()
+option(INSTALL_UDEV_RULES "Install udev rules" ${_udev_default})
 if (INSTALL_UDEV_RULES)
     install (
         FILES 71-hsdaoh.rules

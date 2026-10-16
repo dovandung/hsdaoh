@@ -8,4 +8,5 @@ Description: C Utility Library
 Version: @VERSION@
 Cflags: -I${includedir}/
 Libs: -L${libdir} -lhsdaoh
-Libs.private:  -lusb-1.0 @HSDAOH_PC_LIBS@
+Requires.private: libuvc libusb-1.0
+Libs.private: @hsdaoh_PC_LIBS@ -luvc -lusb-1.0 -lpthread
