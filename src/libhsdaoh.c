@@ -1147,6 +1147,11 @@ int hsdaoh_start_stream(hsdaoh_dev_t *dev, hsdaoh_read_cb_t cb, void *ctx, unsig
 	dev->async_status = HSDAOH_RUNNING;
 	dev->async_cancel = 0;
 
+	/* a new stream: synchronize again from scratch */
+	dev->stream_synced = false;
+	dev->in_order_cnt = 0;
+	dev->frames_since_error = 0;
+
 	dev->cb = cb;
 	dev->cb_ctx = ctx;
 
@@ -1200,6 +1205,9 @@ int hsdaoh_stop_stream(hsdaoh_dev_t *dev)
 		uvc_stop_streaming(dev->uvc_devh);
 
 		hsdaoh_output_stop(dev);
+
+		/* allow hsdaoh_start_stream() again on this handle */
+		dev->async_status = HSDAOH_INACTIVE;
 
 		return 0;
 	}
