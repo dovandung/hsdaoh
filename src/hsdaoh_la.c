@@ -1,12 +1,15 @@
 /*
  * hsdaoh - High Speed Data Acquisition over MS213x USB3 HDMI capture sticks
  *
- * hsdaoh_la: 8 channel logic analyzer front end.
+ * hsdaoh_la: 8 or 4 channel logic analyzer front end.
  *
- * The device (RP2350 'la8' firmware) streams 8-bit samples continuously,
- * two samples per 16-bit link word (first sample in the high byte). This
- * program scans the stream for a trigger condition and saves the samples
- * around the trigger to a file (.sr for PulseView/sigrok, .vcd, or raw .bin).
+ * The device streams samples continuously: the RP2350 'la8' firmware 8-bit
+ * samples, two per 16-bit link word (first sample in the high byte, stream
+ * format PIO_8BIT); the 'la4' firmware 4-bit samples, four per word (first
+ * sample in bits 15:12, format PIO_4BIT). The channel count follows the
+ * stream format. This program scans the stream for a trigger condition and
+ * saves the samples around the trigger to a file (.sr for PulseView/sigrok,
+ * .vcd, or raw .bin; 1 byte per sample, channels in the low bits).
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -51,7 +54,7 @@
 
 #include "hsdaoh.h"
 
-#define LA_CHANNELS		8
+#define LA_CHANNELS		8	/* most channels a stream can have (la8) */
 #define DEFAULT_POST		1000000ULL
 #define DEFAULT_OUTFILE		"capture.sr"
 #define SR_MAX_DATA		0xFFFF0000ULL	/* .sr is a plain (non-zip64) zip */
@@ -95,11 +98,13 @@ typedef struct {
 	uint8_t tbl[65536];	/* tbl[(prev << 8) | cur] != 0: trigger fires on 'cur' */
 	char desc[128];
 	bool immediate;
+	uint8_t used;		/* channels the trigger looks at */
 } trigger_t;
 
 /*
  * Trigger spec: comma separated "channel:condition" terms, all must be true.
- *   channel   0..7 (D0..D7 = GP0..GP7 on the la8 firmware), 'D' prefix allowed
+ *   channel   0..7 (D0..D7 = GP0..GP7 on the la8 firmware; D0..D3 on la4),
+ *             'D' prefix allowed
  *   condition 0 = low, 1 = high, r = rising edge, f = falling edge,
  *             c = any edge (change)
  * Example: "0:r,3:1" fires on a rising edge of D0 while D3 is high.
@@ -163,6 +168,7 @@ static int trigger_parse(trigger_t *t, const char *spec)
 		}
 	}
 	snprintf(t->desc, sizeof(t->desc), "%s", spec);
+	t->used = used;
 	return 0;
 }
 
@@ -241,7 +247,7 @@ static void zip_central_entry(FILE *f, const char *name, uint32_t crc, uint32_t 
 	fwrite(name, 1, strlen(name), f);
 }
 
-static int sr_metadata(char *buf, size_t sz, uint64_t samplerate)
+static int sr_metadata(char *buf, size_t sz, uint64_t samplerate, int channels)
 {
 	int n = snprintf(buf, sz,
 		"[global]\n"
@@ -251,15 +257,15 @@ static int sr_metadata(char *buf, size_t sz, uint64_t samplerate)
 		"capturefile=logic-1\n"
 		"total probes=%d\n"
 		"samplerate=%llu\n"
-		"total analog=0\n", LA_CHANNELS, (unsigned long long)samplerate);
-	for (int i = 0; i < LA_CHANNELS; i++)
+		"total analog=0\n", channels, (unsigned long long)samplerate);
+	for (int i = 0; i < channels; i++)
 		n += snprintf(buf + n, sz - n, "probe%d=D%d\n", i + 1, i);
 	n += snprintf(buf + n, sz - n, "unitsize=1\n");
 	return n;
 }
 
 /* sigrok session file: an uncompressed zip with version, metadata and data */
-static int save_sr(FILE *f, const uint8_t *d, uint64_t n, uint64_t samplerate)
+static int save_sr(FILE *f, const uint8_t *d, uint64_t n, uint64_t samplerate, int channels)
 {
 	static const char ver[] = "2";
 	static const char *names[3] = { "version", "metadata", "logic-1-1" };
@@ -272,7 +278,7 @@ static int save_sr(FILE *f, const uint8_t *d, uint64_t n, uint64_t samplerate)
 	uint16_t ddate = (uint16_t)(((tm->tm_year - 80) << 9) | ((tm->tm_mon + 1) << 5) | tm->tm_mday);
 
 	len[0] = 1;
-	len[1] = (uint32_t)sr_metadata(meta, sizeof(meta), samplerate);
+	len[1] = (uint32_t)sr_metadata(meta, sizeof(meta), samplerate, channels);
 	len[2] = (uint32_t)n;
 	crc[0] = crc32_update(0, (const uint8_t *)ver, 1);
 	crc[1] = crc32_update(0, (const uint8_t *)meta, len[1]);
@@ -316,7 +322,8 @@ static char *put_u64(char *p, uint64_t v)
 	return p;
 }
 
-static int save_vcd(FILE *f, const uint8_t *d, uint64_t n, uint64_t samplerate, uint64_t trigger_pos)
+static int save_vcd(FILE *f, const uint8_t *d, uint64_t n, uint64_t samplerate, uint64_t trigger_pos,
+		    int channels)
 {
 	enum { CHUNK = 256 * 1024, MAX_PER_SAMPLE = 22 + 3 * LA_CHANNELS };
 	double ps = samplerate ? 1e12 / (double)samplerate : 1.0;
@@ -330,7 +337,7 @@ static int save_vcd(FILE *f, const uint8_t *d, uint64_t n, uint64_t samplerate, 
 	fprintf(f, "$comment samplerate %llu Hz, trigger at sample %llu $end\n",
 		(unsigned long long)samplerate, (unsigned long long)trigger_pos);
 	fprintf(f, "$timescale 1 ps $end\n$scope module la $end\n");
-	for (int i = 0; i < LA_CHANNELS; i++)
+	for (int i = 0; i < channels; i++)
 		fprintf(f, "$var wire 1 %c D%d $end\n", '!' + i, i);
 	fprintf(f, "$upscope $end\n$enddefinitions $end\n");
 
@@ -341,7 +348,7 @@ static int save_vcd(FILE *f, const uint8_t *d, uint64_t n, uint64_t samplerate, 
 		uint64_t i = start;
 		if (start == 0) {
 			p += sprintf(p, "#0\n$dumpvars\n");
-			for (int b = 0; b < LA_CHANNELS; b++) {
+			for (int b = 0; b < channels; b++) {
 				*p++ = (char)('0' + ((d[0] >> b) & 1));
 				*p++ = (char)('!' + b);
 				*p++ = '\n';
@@ -357,7 +364,7 @@ static int save_vcd(FILE *f, const uint8_t *d, uint64_t n, uint64_t samplerate, 
 			p = put_u64(p, (uint64_t)((double)i * ps + 0.5));
 			*p++ = '\n';
 			uint8_t x = c ^ last;
-			for (int b = 0; b < LA_CHANNELS; b++) {
+			for (int b = 0; b < channels; b++) {
 				if (x & (1u << b)) {
 					*p++ = (char)('0' + ((c >> b) & 1));
 					*p++ = (char)('!' + b);
@@ -384,7 +391,7 @@ static double now_s(void)
 }
 
 static int save_capture(const char *path, const uint8_t *d, uint64_t n, uint64_t samplerate,
-			uint64_t trigger_pos)
+			uint64_t trigger_pos, int channels)
 {
 	int r;
 	double t0 = now_s();
@@ -396,8 +403,8 @@ static int save_capture(const char *path, const uint8_t *d, uint64_t n, uint64_t
 	setvbuf(f, NULL, _IOFBF, 4 << 20);
 
 	switch (out_type_from_name(path)) {
-	case OUT_SR:  r = save_sr(f, d, n, samplerate); break;
-	case OUT_VCD: r = save_vcd(f, d, n, samplerate, trigger_pos); break;
+	case OUT_SR:  r = save_sr(f, d, n, samplerate, channels); break;
+	case OUT_VCD: r = save_vcd(f, d, n, samplerate, trigger_pos, channels); break;
 	default:      r = write_all(f, d, n); break;
 	}
 	if (fflush(f) || ferror(f))
@@ -428,6 +435,7 @@ typedef struct {
 	uint64_t len;
 	uint64_t trigger_pos;
 	uint32_t srate;
+	int channels;
 	bool partial;
 	int state;
 	unsigned seq;
@@ -479,6 +487,7 @@ typedef struct {
 	volatile uint64_t gaps;
 	volatile uint64_t lost_samples;
 	uint32_t srate;
+	int channels;			/* 8 (la8) or 4 (la4), 0 until known */
 	bool error;
 } la_t;
 
@@ -511,7 +520,7 @@ static void *saver_thread(void *arg)
 #ifdef HSDAOH_LA_TEST_SAVE_DELAY_US
 			usleep(HSDAOH_LA_TEST_SAVE_DELAY_US);	/* tests only: simulate a slow disk */
 #endif
-			int r = save_capture(b->path, b->data, b->len, b->srate, b->trigger_pos);
+			int r = save_capture(b->path, b->data, b->len, b->srate, b->trigger_pos, b->channels);
 			pthread_mutex_lock(&la->mtx);
 			b->state = CB_FREE;
 			b->len = 0;
@@ -745,6 +754,7 @@ static void la_process_samples(la_t *la, const uint8_t *s, size_t n)
 
 			la_capture_name(la, b->path, sizeof(b->path));
 			b->srate = la->srate_override ? (uint32_t)la->srate_override : la->srate;
+			b->channels = la->channels ? la->channels : LA_CHANNELS;
 			hist_copy(la, b->data, from_hist);
 			memcpy(b->data + from_hist, s + k - from_lin, from_lin);
 			b->len = from_hist + from_lin;
@@ -786,17 +796,45 @@ static void la_process_samples(la_t *la, const uint8_t *s, size_t n)
 	}
 }
 
-/* One buffer from the device: words = 16-bit link words, 2 samples each,
- * first sample in the high byte. data_cnt as reported by libhsdaoh. */
-static void la_process_buffer(la_t *la, const uint8_t *buf, size_t len, uint64_t data_cnt, uint32_t srate)
+/* channels in a stream of this format (libhsdaoh's data_info.format) */
+static int la_channels_for_format(unsigned format)
+{
+	return format == HSDAOH_FORMAT_PIO_4BIT ? 4 : 8;
+}
+
+/* One buffer from the device: words = 16-bit link words, 8 channels: 2
+ * samples each, first sample in the high byte; 4 channels: 4 samples each,
+ * first sample in bits 15:12. data_cnt as reported by libhsdaoh. */
+static void la_process_buffer(la_t *la, const uint8_t *buf, size_t len, uint64_t data_cnt, uint32_t srate,
+			      int channels)
 {
 	size_t words = len / 2;
-	size_t n = words * 2;
+	size_t spw = channels == 4 ? 4 : 2;	/* samples per word */
+	size_t n = words * spw;
 
 	if (la->state == LA_DONE || !words)
 		return;
 	if (srate)
 		la->srate = srate;
+	if (la->channels != channels) {
+		if (la->channels) {
+			fprintf(stderr, "The device changed from %d to %d channels, stopping.\n",
+				la->channels, channels);
+			la->error = true;
+			la->state = LA_DONE;
+			return;
+		}
+		la->channels = channels;
+		if (la->trig.used >> channels) {
+			fprintf(stderr, "The trigger uses channels above D%d, but the device sends "
+				"%d channels.\n", channels - 1, channels);
+			la->error = true;
+			la->state = LA_DONE;
+			return;
+		}
+		if (!la->quiet)
+			fprintf(stderr, "Device sends %d channels (D0..D%d).\n", channels, channels - 1);
+	}
 
 	/* gap detection via the device's word counter */
 	if (!la->cnt_unsupported) {
@@ -804,7 +842,7 @@ static void la_process_buffer(la_t *la, const uint8_t *buf, size_t len, uint64_t
 			la->cnt_unsupported = true;
 			fprintf(stderr, "Note: firmware does not report its sample counter; lost data cannot be detected.\n");
 		} else if (la->cnt_known && data_cnt != la->next_cnt) {
-			uint64_t lost = (data_cnt > la->next_cnt) ? (data_cnt - la->next_cnt) * 2 : 0;
+			uint64_t lost = (data_cnt > la->next_cnt) ? (data_cnt - la->next_cnt) * spw : 0;
 			la_on_gap(la, lost);
 		}
 		la->next_cnt = data_cnt + words;
@@ -822,10 +860,22 @@ static void la_process_buffer(la_t *la, const uint8_t *buf, size_t len, uint64_t
 			return;
 		}
 	}
-	/* undo the word packing: high byte is the earlier sample */
-	for (size_t w = 0; w < words; w++) {
-		la->lin[2 * w] = buf[2 * w + 1];
-		la->lin[2 * w + 1] = buf[2 * w];
+	/* undo the word packing (words arrive little endian) */
+	if (spw == 2) {
+		/* high byte is the earlier sample */
+		for (size_t w = 0; w < words; w++) {
+			la->lin[2 * w] = buf[2 * w + 1];
+			la->lin[2 * w + 1] = buf[2 * w];
+		}
+	} else {
+		/* bits 15:12 are the earliest sample, 3:0 the latest */
+		for (size_t w = 0; w < words; w++) {
+			uint8_t hi = buf[2 * w + 1], lo = buf[2 * w];
+			la->lin[4 * w] = hi >> 4;
+			la->lin[4 * w + 1] = hi & 0x0f;
+			la->lin[4 * w + 2] = lo >> 4;
+			la->lin[4 * w + 3] = lo & 0x0f;
+		}
 	}
 
 	la_process_samples(la, la->lin, n);
@@ -844,7 +894,8 @@ static void la_callback(hsdaoh_data_info_t *di)
 {
 	if (di->stream_id != 0 || do_exit)
 		return;
-	la_process_buffer(&la, di->buf, di->len, di->data_cnt, di->srate);
+	la_process_buffer(&la, di->buf, di->len, di->data_cnt, di->srate,
+			  la_channels_for_format(di->format));
 }
 
 /* ------------------------------------------------------- Pico serial port */
@@ -1050,7 +1101,8 @@ static uint64_t parse_count(const char *s)
 static void usage(void)
 {
 	fprintf(stderr,
-		"hsdaoh_la, 8 channel logic analyzer for the hsdaoh RP2350 'la8' firmware\n\n"
+		"hsdaoh_la, logic analyzer for the hsdaoh RP2350 'la8' (8 channels) and\n"
+		"'la4' (4 channels) firmware; the channel count follows the device\n\n"
 		"Usage: hsdaoh_la [options]\n"
 		"\t-t trigger   comma separated channel:condition terms, all must be true\n"
 		"\t             condition: 0 low, 1 high, r rising, f falling, c any edge\n"
@@ -1064,7 +1116,8 @@ static void usage(void)
 		"\t-d index     device index (default 0)\n"
 		"\t-s port      the Pico's USB serial port (Windows: COM5, Linux: /dev/ttyACM0)\n"
 		"\t-D div       with -s: set the sample rate divider before capturing,\n"
-		"\t             rate = Pico system clock / div (la8 140 MS/s preset: 280 MHz / div)\n"
+		"\t             rate = Pico system clock / div (la8 140 MS/s and la4 280 MS/s\n"
+		"\t             presets: 280 MHz / div)\n"
 		"\t             -s without -D only shows the current setting\n\n"
 		"Captures are collected in RAM (1 byte per sample, -p + -n bytes; twice that\n"
 		"with -c other than 1) and written to disk after the capture.\n", DEFAULT_OUTFILE);

@@ -621,6 +621,10 @@ int hsdaoh_set_output_format(hsdaoh_dev_t *dev, hsdaoh_output_format_t format)
 	return 0;
 }
 
+/* the public format IDs in hsdaoh.h must match the private enum */
+typedef char hsdaoh_check_pio_4bit[(HSDAOH_FORMAT_PIO_4BIT == PIO_4BIT) ? 1 : -1];
+typedef char hsdaoh_check_pio_8bit[(HSDAOH_FORMAT_PIO_8BIT == PIO_8BIT) ? 1 : -1];
+
 static void hsdaoh_output(hsdaoh_dev_t *dev, uint16_t sid, int format, uint32_t srate, uint8_t *data, size_t len,
 			  uint64_t data_cnt)
 {
@@ -636,6 +640,7 @@ static void hsdaoh_output(hsdaoh_dev_t *dev, uint16_t sid, int format, uint32_t 
 	data_info.is_float = false;
 	data_info.device_error = false;
 	data_info.data_cnt = data_cnt;
+	data_info.format = (uint16_t)format;
 
 	switch (format) {
 		case PIO_8BIT_IQ:

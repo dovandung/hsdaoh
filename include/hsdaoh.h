@@ -53,7 +53,18 @@ typedef struct hsdaoh_data_info {
 	 * previous buffer's data_cnt plus the previous buffer's word count, data
 	 * was lost in between. Counts raw link words, also for unpacked formats. */
 	uint64_t data_cnt;
+	/* Stream format as sent by the device (PIO_8BIT, PIO_4BIT, ... from
+	 * hsdaoh_private.h / the firmware's picohsdaoh.h), so a program can
+	 * tell e.g. 8 channel (la8) from 4 channel (la4) logic data. Added at
+	 * the end of the struct: programs built against older headers still
+	 * work. */
+	uint16_t format;
 } hsdaoh_data_info_t;
+
+/* stream format IDs used by the logic analyzer firmware (same values as in
+ * hsdaoh_private.h and the firmware's picohsdaoh.h) */
+#define HSDAOH_FORMAT_PIO_4BIT	8
+#define HSDAOH_FORMAT_PIO_8BIT	12
 
 typedef struct hsdaoh_dev hsdaoh_dev_t;
 
