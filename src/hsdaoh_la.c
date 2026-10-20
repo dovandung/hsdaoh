@@ -1061,9 +1061,12 @@ static int pico_command(const char *port, const char *cmd)
 		len += (size_t)n;
 		reply[len] = 0;
 		if (strstr(reply, "commands:")) {
-			ok = !strstr(reply, "divider must be") && !strstr(reply, "unknown command");
+			ok = !strstr(reply, "divider must be") && !strstr(reply, "unknown command") &&
+			     !strstr(reply, "channels must be");
 			done = true;
 		} else if (strstr(reply, "divider must be") && strchr(strstr(reply, "divider must be"), '\n')) {
+			done = true;
+		} else if (strstr(reply, "channels must be") && strchr(strstr(reply, "channels must be"), '\n')) {
 			done = true;
 		}
 		if (len >= sizeof(reply) - 1)
@@ -1072,7 +1075,7 @@ static int pico_command(const char *port, const char *cmd)
 	ser_close(s);
 
 	if (!len) {
-		fprintf(stderr, "No answer from the Pico on %s (is la8 running on it?).\n", port);
+		fprintf(stderr, "No answer from the Pico on %s (is la8, la4 or la48 running on it?).\n", port);
 		return -1;
 	}
 	/* print the answer without the help line */
@@ -1118,7 +1121,9 @@ static void usage(void)
 		"\t-D div       with -s: set the sample rate divider before capturing,\n"
 		"\t             rate = Pico system clock / div (la8 140 MS/s and la4 280 MS/s\n"
 		"\t             presets: 280 MHz / div)\n"
-		"\t             -s without -D only shows the current setting\n\n"
+		"\t             -s without -D only shows the current setting\n"
+		"\t-C 4|8       with -s, la48 firmware: switch to 4 channels (D0..D3,\n"
+		"\t             up to 280 MS/s) or 8 channels (up to 140 MS/s)\n\n"
 		"Captures are collected in RAM (1 byte per sample, -p + -n bytes; twice that\n"
 		"with -c other than 1) and written to disk after the capture.\n", DEFAULT_OUTFILE);
 	exit(1);
@@ -1147,14 +1152,14 @@ int main(int argc, char **argv)
 	int dev_index = 0;
 	const char *trig = NULL;
 	const char *ser_port = NULL;
-	long set_div = 0;
+	long set_div = 0, set_ch = 0;
 
 	memset(&la, 0, sizeof(la));
 	la.post = DEFAULT_POST;
 	la.captures_wanted = 1;
 	snprintf(la.out_base, sizeof(la.out_base), "%s", DEFAULT_OUTFILE);
 
-	while ((opt = getopt(argc, argv, "t:n:p:o:c:r:Gd:s:D:qh")) != -1) {
+	while ((opt = getopt(argc, argv, "t:n:p:o:c:r:Gd:s:D:C:qh")) != -1) {
 		switch (opt) {
 		case 't': trig = optarg; break;
 		case 'n': la.post = parse_count(optarg); break;
@@ -1166,6 +1171,7 @@ int main(int argc, char **argv)
 		case 'd': dev_index = atoi(optarg); break;
 		case 's': ser_port = optarg; break;
 		case 'D': set_div = strtol(optarg, NULL, 10); break;
+		case 'C': set_ch = strtol(optarg, NULL, 10); break;
 		case 'q': la.quiet = true; break;
 		default: usage();
 		}
@@ -1173,15 +1179,32 @@ int main(int argc, char **argv)
 	if (la.post == 0)
 		la.post = 1;
 
-	if (set_div && !ser_port) {
-		fprintf(stderr, "-D needs the Pico's serial port: -s COM5 (Windows) or -s /dev/ttyACM0\n");
+	if ((set_div || set_ch) && !ser_port) {
+		fprintf(stderr, "-D and -C need the Pico's serial port: -s COM5 (Windows) or -s /dev/ttyACM0\n");
+		return 1;
+	}
+	if (set_ch && set_ch != 4 && set_ch != 8) {
+		fprintf(stderr, "-C must be 4 or 8\n");
 		return 1;
 	}
 	if (set_div < 0 || set_div > 65535) {
 		fprintf(stderr, "-D must be 1..65535\n");
 		return 1;
 	}
-	if (ser_port) {
+	if (ser_port && set_ch) {
+		/* la48 firmware: switch the channel count first (it may raise the
+		 * divider to the new mode's minimum; -D below sets the rate) */
+		char cmd[16];
+		snprintf(cmd, sizeof(cmd), "ch %ld", set_ch);
+		int pr = pico_command(ser_port, cmd);
+		if (pr) {
+			if (pr == -1)
+				fprintf(stderr, "The Pico did not accept '%s' (-C needs the la48 firmware), "
+					"not capturing.\n", cmd);
+			return 1;
+		}
+	}
+	if (ser_port && (set_div || !set_ch)) {
 		char cmd[32];
 		if (set_div)
 			snprintf(cmd, sizeof(cmd), "div %ld", set_div);
